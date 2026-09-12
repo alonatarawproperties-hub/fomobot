@@ -48,11 +48,26 @@ export function extractSignedTxs(l2MsgB64) {
 
 /**
  * Decode one frame into normalised transactions.
- * `from` is recovered from the signature by ethers — the feed does not carry it.
+ *
+ * `prefilter` is an array of 20-byte address Buffers. When given, a transaction
+ * whose raw bytes contain none of them is dropped WITHOUT being parsed. This is
+ * the difference between idling and pegging a core: parsing is dominated by ECDSA
+ * signature recovery, and at ~26 transactions a second across the whole chain
+ * that cost is entirely wasted on traffic belonging to nobody we watch.
+ *
+ * The trade is real and is the caller's to make. The sender is NOT in the bytes
+ * — it is recovered from the signature — so a wallet that signs its own
+ * transactions cannot be found this way. Pass no prefilter for those. Addresses
+ * appearing as `to` or inside calldata (the 4337 case) are found normally, since
+ * both sit in the bytes verbatim.
+ *
+ * `from` is recovered by ethers for whatever survives the filter; the feed does
+ * not carry it.
  */
-export function decodeFrame(frame, seenAt = Date.now()) {
+export function decodeFrame(frame, seenAt = Date.now(), prefilter = null) {
   const txs = [];
   const seqs = [];
+  let skipped = 0;
 
   for (const m of frame?.messages ?? []) {
     const inner = m?.message?.message;
@@ -61,6 +76,11 @@ export function decodeFrame(frame, seenAt = Date.now()) {
     if (!l2) continue;
 
     for (const raw of extractSignedTxs(l2)) {
+      if (prefilter && prefilter.length && !prefilter.some((needle) => raw.includes(needle))) {
+        skipped++;
+        continue;
+      }
+
       let tx;
       try {
         tx = Transaction.from('0x' + raw.toString('hex'));
@@ -86,5 +106,5 @@ export function decodeFrame(frame, seenAt = Date.now()) {
     }
   }
 
-  return { txs, seqs };
+  return { txs, seqs, skipped };
 }

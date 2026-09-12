@@ -10,14 +10,17 @@ import { decodeFrame } from './decode.mjs';
 
 export class SequencerFeed extends EventEmitter {
   /**
-   * @param {object}  opts
-   * @param {string}  opts.url         wss:// feed endpoint
-   * @param {number} [opts.silenceMs]  no frame for this long => 'stall'
-   * @param {number} [opts.maxBackoffMs]
+   * @param {object}    opts
+   * @param {string}    opts.url         wss:// feed endpoint
+   * @param {Buffer[]} [opts.prefilter]  20-byte addresses; transactions whose raw
+   *                                     bytes contain none are never parsed
+   * @param {number}   [opts.silenceMs]  no frame for this long => 'stall'
+   * @param {number}   [opts.maxBackoffMs]
    */
-  constructor({ url, silenceMs = 15_000, maxBackoffMs = 10_000 }) {
+  constructor({ url, prefilter = null, silenceMs = 15_000, maxBackoffMs = 10_000 }) {
     super();
     this.url = url;
+    this.prefilter = prefilter;
     this.silenceMs = silenceMs;
     this.maxBackoffMs = maxBackoffMs;
 
@@ -29,8 +32,11 @@ export class SequencerFeed extends EventEmitter {
     this.stallTimer = null;
     this.stalled = false;
 
-    this.stats = { frames: 0, txs: 0, reconnects: 0, gaps: 0, decodeErrors: 0 };
+    this.stats = { frames: 0, txs: 0, skipped: 0, reconnects: 0, gaps: 0, decodeErrors: 0 };
   }
+
+  /** Swap the prefilter when the roster changes, without dropping the socket. */
+  setPrefilter(prefilter) { this.prefilter = prefilter; }
 
   start() {
     this.stopped = false;
@@ -114,7 +120,7 @@ export class SequencerFeed extends EventEmitter {
 
     let decoded;
     try {
-      decoded = decodeFrame(frame, seenAt);
+      decoded = decodeFrame(frame, seenAt, this.prefilter);
     } catch (err) {
       this.stats.decodeErrors++;
       this.emit('warn', { at: 'decode', message: err?.message ?? String(err) });
@@ -130,6 +136,8 @@ export class SequencerFeed extends EventEmitter {
       // so out-of-order and repeated sequence numbers are both expected.
       if (this.lastSeq === null || seq > this.lastSeq) this.lastSeq = seq;
     }
+
+    this.stats.skipped += decoded.skipped;
 
     if (decoded.txs.length) {
       this.stats.txs += decoded.txs.length;
