@@ -22,13 +22,16 @@ export class SolanaWatcher extends EventEmitter {
    * @param {string}   opts.httpUrl    same provider, https:// — used for enrichment
    * @param {string[]} opts.addresses  base58 wallets to watch
    * @param {string}  [opts.commitment]
+   * @param {number}  [opts.pingMs]    how often to prove the socket round-trips
+   * @param {number}  [opts.silenceMs] cycle only after this long with NO reply at all
    */
-  constructor({ wsUrl, httpUrl, addresses, commitment = 'processed', silenceMs = 120_000 }) {
+  constructor({ wsUrl, httpUrl, addresses, commitment = 'processed', pingMs = 30_000, silenceMs = 90_000 }) {
     super();
     this.wsUrl = wsUrl;
     this.httpUrl = httpUrl;
     this.addresses = addresses;
     this.commitment = commitment;
+    this.pingMs = pingMs;
     this.silenceMs = silenceMs;
 
     this.ws = null;
@@ -37,11 +40,12 @@ export class SolanaWatcher extends EventEmitter {
     this.nextId = 1;
     this.subs = new Map();         // rpc id -> address, until the subscription confirms
     this.subToAddress = new Map(); // subscription id -> address
+    this.pingIds = new Set();      // ids we sent purely to test liveness
     this.seen = new Set();         // signature dedupe; logs can repeat across commitments
     this.lastMsgAt = 0;
     this.pingTimer = null;
 
-    this.stats = { hits: 0, reconnects: 0, enriched: 0, enrichFailed: 0 };
+    this.stats = { hits: 0, reconnects: 0, enriched: 0, enrichFailed: 0, pings: 0 };
   }
 
   start() { this.stopped = false; this.#connect(); }
@@ -60,6 +64,7 @@ export class SolanaWatcher extends EventEmitter {
     this.ws = ws;
     this.subs.clear();
     this.subToAddress.clear();
+    this.pingIds.clear();
 
     ws.addEventListener('open', () => {
       this.attempt = 0;
@@ -93,22 +98,52 @@ export class SolanaWatcher extends EventEmitter {
 
   #armWatchdog() {
     clearInterval(this.pingTimer);
-    // A quiet wallet is normal here — unlike the sequencer feed, silence is not by
-    // itself a fault. So this proves the SOCKET is alive rather than the flow.
+    // A quiet wallet produces NO notifications at all — logsSubscribe speaks only
+    // when the wallet moves. So the absence of notifications says nothing about the
+    // socket's health, and an earlier version of this treated it as a fault: it
+    // closed a perfectly good connection every couple of minutes, and every one of
+    // those reconnects is a window in which the wallet is not subscribed and a
+    // trade is missed outright.
+    //
+    // Liveness is therefore PROVEN, not inferred. Send a request the pubsub
+    // endpoint does not implement and expect its error reply back; any reply means
+    // the socket still round-trips. Solana's pubsub only implements
+    // *Subscribe/*Unsubscribe, so this costs nothing and needs no extra
+    // subscription — slotSubscribe would work too, at ~6.5M notifications a month
+    // against a free-tier quota, for the same one bit of information.
     this.pingTimer = setInterval(() => {
       if (this.ws?.readyState !== WebSocket.OPEN) return;
+
       const quiet = Date.now() - this.lastMsgAt;
       if (quiet > this.silenceMs) {
-        this.emit('warn', { at: 'watchdog', message: `no traffic for ${quiet}ms, cycling socket` });
-        try { this.ws.close(); } catch { /* reconnect handles it */ }
+        // Pings went unanswered too, so this is a genuinely dead socket.
+        this.emit('warn', { at: 'watchdog', message: `no reply for ${quiet}ms despite pings, cycling socket` });
+        try { this.ws.close(); } catch { /* the close handler reconnects */ }
+        return;
       }
-    }, 30_000);
+
+      const id = this.nextId++;
+      this.pingIds.add(id);
+      // Bounded: a reply that never comes must not accumulate forever.
+      if (this.pingIds.size > 10) this.pingIds.delete(this.pingIds.values().next().value);
+      this.stats.pings++;
+      try {
+        this.ws.send(JSON.stringify({ jsonrpc: '2.0', id, method: 'ping' }));
+      } catch { /* the close handler reconnects */ }
+    }, this.pingMs);
   }
 
   #onMessage(ev) {
     this.lastMsgAt = Date.now();
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
+
+    // A ping's reply. Its arrival already did its job by updating lastMsgAt above;
+    // it is an error response by design, so it must not be reported as one.
+    if (msg.id !== undefined && this.pingIds.has(msg.id)) {
+      this.pingIds.delete(msg.id);
+      return;
+    }
 
     // Subscription confirmation: { id, result: <subscriptionId> }
     if (msg.id !== undefined && typeof msg.result === 'number') {
