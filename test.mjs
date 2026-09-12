@@ -52,7 +52,8 @@ const trader = Wallet.createRandom();
 const relayer = Wallet.createRandom();
 const ROUTER = '0x1111111111111111111111111111111111111111';
 
-// A direct trade: the trader signs and sends it themselves.
+// A direct trade: the trader signs and sends it themselves. Their address is NOT
+// in the bytes anywhere — it is recovered from the signature.
 const directRaw = await sign(trader, {
   to: ROUTER, data: '0xdeadbeef' + '00'.repeat(32), value: 12345n, nonce: 3,
 });
@@ -96,6 +97,40 @@ const relayedRaw = await sign(relayer, {
   ok('sender is recovered from the signature, with to/selector/value/nonce intact');
 }
 
+console.log('\nprefilter');
+
+const traderNeedle = Buffer.from(trader.address.slice(2), 'hex');
+
+{
+  // The whole point: traffic belonging to nobody we watch is dropped before the
+  // ECDSA recovery that dominates parsing cost.
+  const stranger = Wallet.createRandom();
+  const noise = await sign(stranger, { to: ROUTER, data: '0x12345678', nonce: 1 });
+  const r = decodeFrame(frameOf(buildBatch([noise])), Date.now(), [traderNeedle]);
+  assert.equal(r.txs.length, 0);
+  assert.equal(r.skipped, 1);
+  ok('unrelated traffic is skipped without being parsed');
+}
+{
+  const r = decodeFrame(frameOf(buildBatch([relayedRaw])), Date.now(), [traderNeedle]);
+  assert.equal(r.txs.length, 1);
+  assert.equal(r.skipped, 0);
+  assert.equal(r.txs[0].from, relayer.address.toLowerCase());
+  ok('an address embedded in calldata still survives the prefilter');
+}
+{
+  // The documented cost, asserted so it stays a decision rather than a surprise:
+  // a wallet that only ever SENDS is invisible to a byte scan, because the sender
+  // is derived from the signature and appears nowhere in the bytes.
+  const r = decodeFrame(frameOf(buildBatch([directRaw])), Date.now(), [traderNeedle]);
+  assert.equal(r.txs.length, 0);
+  assert.equal(r.skipped, 1);
+  // ...and it IS found once the filter is off.
+  const unfiltered = decodeFrame(frameOf(buildBatch([directRaw])));
+  assert.equal(unfiltered.txs[0].from, trader.address.toLowerCase());
+  ok('a sender-only wallet is NOT found under the prefilter, but is without it');
+}
+
 console.log('\nmatcher');
 
 const roster = new Roster([{ handle: 'target', address: trader.address }]);
@@ -127,6 +162,17 @@ const { txs } = decodeFrame(frameOf(buildBatch([directRaw, relayedRaw])));
   assert.throws(() => new Roster([{ handle: 'bad', address: '0xnope' }]), /not a 20-byte hex address/);
   assert.equal(new Roster([{ handle: 'off', address: trader.address, enabled: false }]).size, 0);
   ok('bad addresses are rejected and disabled entries are not watched');
+}
+{
+  const needles = roster.needles();
+  assert.equal(needles.length, 1);
+  assert.equal(needles[0].length, 20);
+  assert.ok(needles[0].equals(traderNeedle));
+  assert.equal(roster.anySelfSends, false);
+  // One self-sending entry must turn the filter off for the whole feed, since a
+  // byte scan cannot see it.
+  assert.equal(new Roster([{ handle: 'x', address: trader.address, selfSends: true }]).anySelfSends, true);
+  ok('needles are raw 20-byte addresses and selfSends disables the prefilter');
 }
 {
   const sig = toSignal(txs[0], roster.match(txs[0]));
