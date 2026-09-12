@@ -16,7 +16,10 @@ export class Roster {
     this.replace(entries);
   }
 
-  /** @param {Array<{handle:string, address:string, enabled?:boolean, notes?:string}>} entries */
+  /**
+   * @param {Array<{handle:string, address:string, enabled?:boolean,
+   *                selfSends?:boolean, notes?:string}>} entries
+   */
   replace(entries) {
     const next = new Map();
     for (const e of entries) {
@@ -30,6 +33,7 @@ export class Roster {
         handle: e.handle ?? addr.slice(0, 10),
         address: addr,
         bare: addr.slice(2), // no 0x, for calldata scanning
+        selfSends: e.selfSends === true,
         notes: e.notes ?? null,
       });
     }
@@ -39,6 +43,21 @@ export class Roster {
 
   get size() { return this.byAddress.size; }
   list() { return [...this.byAddress.values()]; }
+
+  /**
+   * Raw 20-byte addresses, for scanning transaction bytes before parsing them.
+   * Finds an address used as `to` or embedded in calldata. It cannot find one
+   * that only ever appears as the SENDER, since that is recovered from the
+   * signature and never appears in the bytes — see `anySelfSends`.
+   */
+  needles() {
+    return this.list().map((e) => Buffer.from(e.bare, 'hex'));
+  }
+
+  /** True if any entry signs its own transactions, which forbids the prefilter. */
+  get anySelfSends() {
+    return this.list().some((e) => e.selfSends);
+  }
 
   /**
    * @returns {null | {entry: object, via: 'sender'|'calldata'}}

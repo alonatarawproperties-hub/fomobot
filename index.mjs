@@ -67,28 +67,21 @@ const notifier = new Notifier({ ...(config.telegram ?? {}), enabled: !DRY && con
 const solEntries = config.roster.filter((e) => e.solana && e.enabled !== false);
 const solByAddress = new Map(solEntries.map((e) => [e.solana, e.handle ?? e.solana.slice(0, 6)]));
 
+// Parsing a transaction is dominated by ECDSA signature recovery. Doing it for
+// every transaction on the chain pegged a core in production (8min CPU in 8min
+// wall, 12,794 transactions), which on a shared-core VM burns through burst
+// credits and then throttles detection. Scanning the raw bytes first costs
+// almost nothing. The exception is a wallet that signs its own transactions:
+// its address is never IN the bytes, so one such entry turns the filter off.
+const prefilterOn = roster.size > 0 && !roster.anySelfSends;
+
 log('info', 'starting', {
   robinhoodChain: roster.size ? config.feedUrl : 'disabled',
   solana: solEntries.length ? `${solEntries.length} wallet(s)` : 'disabled',
   handles: [...new Set([...roster.list().map((e) => e.handle), ...solByAddress.values()])],
+  scan: roster.size ? (prefilterOn ? 'prefiltered (cheap)' : 'full recovery (selfSends set)') : 'n/a',
   telegram: notifier.enabled ? 'on' : 'off',
   recording: recorder.path,
-});
-
-// --- roster hot reload -------------------------------------------------------
-// Only the EVM side reloads live. Solana subscriptions are bound to an open
-// socket, so changing those wallets needs a restart — said plainly rather than
-// silently ignored.
-watchFile(CONFIG_PATH, { interval: 2000 }, () => {
-  try {
-    const next = loadConfig(CONFIG_PATH);
-    roster.replace(next.roster.filter((e) => e.address));
-    log('info', 'roster reloaded', { watching: roster.size });
-    notifier.send(`🔁 EVM roster reloaded — ${roster.size} watched. Solana changes need a restart.`);
-  } catch (err) {
-    log('error', 'roster reload rejected, keeping previous', { error: err.message });
-    notifier.send(`⚠️ Roster reload FAILED, still on the previous one\n${err.message}`);
-  }
 });
 
 // --- Robinhood Chain ---------------------------------------------------------
@@ -96,7 +89,11 @@ watchFile(CONFIG_PATH, { interval: 2000 }, () => {
 // roster does not hold a socket open against a chain nobody trades on.
 let feed = null;
 if (roster.size) {
-  feed = new SequencerFeed({ url: config.feedUrl, silenceMs: config.silenceMs ?? 15_000 });
+  feed = new SequencerFeed({
+    url: config.feedUrl,
+    prefilter: prefilterOn ? roster.needles() : null,
+    silenceMs: config.silenceMs ?? 15_000,
+  });
 
   feed.on('open', ({ connectMs }) => log('info', 'rh feed connected', { connectMs }));
   feed.on('closed', (d) => log('warn', 'rh feed closed, reconnecting', d));
@@ -133,6 +130,25 @@ if (roster.size) {
 } else {
   log('info', 'robinhood chain watcher disabled', { reason: 'no EVM addresses in roster' });
 }
+
+// --- roster hot reload -------------------------------------------------------
+// Only the EVM side reloads live. Solana subscriptions are bound to an open
+// socket, so changing those wallets needs a restart — said plainly rather than
+// silently ignored.
+watchFile(CONFIG_PATH, { interval: 2000 }, () => {
+  try {
+    const next = loadConfig(CONFIG_PATH);
+    roster.replace(next.roster.filter((e) => e.address));
+    // The filter must follow the roster, or a newly added wallet is scanned for
+    // using the old list and never matches.
+    feed?.setPrefilter(roster.size > 0 && !roster.anySelfSends ? roster.needles() : null);
+    log('info', 'roster reloaded', { watching: roster.size });
+    notifier.send(`🔁 EVM roster reloaded — ${roster.size} watched. Solana changes need a restart.`);
+  } catch (err) {
+    log('error', 'roster reload rejected, keeping previous', { error: err.message });
+    notifier.send(`⚠️ Roster reload FAILED, still on the previous one\n${err.message}`);
+  }
+});
 
 // --- Solana ------------------------------------------------------------------
 let sol = null;
