@@ -1,0 +1,32 @@
+{
+  "_comment": "Copy to config.json and fill in solana.wsUrl / solana.httpUrl with a Helius key (free tier is enough), plus your Telegram bot token and chat id. Robinhood Chain needs no key.",
+
+  "feedUrl": "wss://feed.mainnet.chain.robinhood.com",
+  "explorerBase": "https://robinhoodchain.blockscout.com",
+  "silenceMs": 15000,
+  "heartbeatMs": 60000,
+
+  "solana": {
+    "wsUrl": "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
+    "httpUrl": "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
+    "commitment": "processed"
+  },
+
+  "roster": [
+    {
+      "handle": "ruralvalidsnake",
+      "solana": "3owNGvPDRmgdTSBkp8ro2d5zBJCpnGi4nDhSkpgpqXeZ",
+      "address": "0xb054643d9446d778511be5ed8f46d349b8ecc2c0",
+      "enabled": true,
+      "notes": "EVM side is an EIP-7702 delegated ERC-4337 account (delegate 0xe6cae83bde06e4c305530e199d7217f42808555b); nonce 1, zero balance, so trades arrive via a bundler and match on calldata, never on sender. Volume is on Solana."
+    }
+  ],
+
+  "telegram": {
+    "enabled": true,
+    "botToken": "PUT_BOT_TOKEN_HERE",
+    "chatId": "PUT_CHAT_ID_HERE"
+  },
+
+  "record": { "dir": "./data", "file": "signals.jsonl" }
+}
