@@ -39,9 +39,20 @@ export const EXIT = {
 const exit = (reason, fraction, detail) => ({ action: 'exit', reason, fraction, detail: detail ?? null });
 const hold = (detail) => ({ action: 'hold', detail: detail ?? null });
 
-/** Gain in basis points; negative is a loss. */
+/** A real, finite number. Written out because the operators lie about null. */
+const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+
+/**
+ * Gain in basis points; negative is a loss. null when it cannot be computed.
+ *
+ * Both bounds are typeof-checked rather than compared, because `null >= 0` is
+ * TRUE in JavaScript: an earlier `!(price >= 0)` guard let null straight through
+ * and `null - entryPrice` coerced to a clean -100%, handing the stop loss exactly
+ * the number that dumps a position on a missing reading.
+ */
 export function gainBps(entryPrice, price) {
-  if (!(entryPrice > 0) || !(price >= 0)) return null;
+  if (!isNum(entryPrice) || entryPrice <= 0) return null;
+  if (!isNum(price) || price < 0) return null;
   return Math.round(((price - entryPrice) / entryPrice) * 10_000);
 }
 
@@ -61,7 +72,7 @@ export function decideExit(position, market, rules, now = Date.now()) {
   //    price beats leaving later at no price. Only acts on a READ value — a null
   //    reading is unknown, not empty, and treating those alike would dump every
   //    position on an RPC failure.
-  if (typeof market.liquidityUsd === 'number' && rules.minLiquidityUsd > 0
+  if (isNum(market.liquidityUsd) && rules.minLiquidityUsd > 0
       && market.liquidityUsd < rules.minLiquidityUsd) {
     return exit(EXIT.LIQUIDITY_DRAIN, position.remaining, market.liquidityUsd);
   }
@@ -71,10 +82,9 @@ export function decideExit(position, market, rules, now = Date.now()) {
   // 3. Price-dependent rules. An unreadable price holds rather than exits: panic
   //    selling on a blip is a loss we invented. The clock-based rule below still
   //    runs, so an unknown price cannot freeze the position forever either.
-  if (typeof market.price === 'number' && market.price >= 0) {
-    const g = gainBps(position.entryPrice, market.price);
-
-    if (g !== null && rules.stopLossBps > 0 && g <= -rules.stopLossBps) {
+  const g = gainBps(position.entryPrice, market.price);
+  if (g !== null) {
+    if (rules.stopLossBps > 0 && g <= -rules.stopLossBps) {
       return exit(EXIT.STOP_LOSS, position.remaining, g);
     }
 
@@ -82,7 +92,7 @@ export function decideExit(position, market, rules, now = Date.now()) {
     // reached wins, so a fast move does not have to touch every rung.
     const taken = new Set(position.laddersTaken ?? []);
     const due = (rules.ladder ?? [])
-      .filter((l) => !taken.has(l.gainBps) && g !== null && g >= l.gainBps)
+      .filter((l) => !taken.has(l.gainBps) && g >= l.gainBps)
       .sort((a, b) => b.gainBps - a.gainBps)[0];
     if (due) {
       // Never promise more than is left, and never strand a sliver too small to
