@@ -1,6 +1,6 @@
 {
   "name": "firstfill",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Low-latency detection of roster wallets on Solana and the Robinhood Chain sequencer feed",
@@ -8,9 +8,9 @@
   "scripts": {
     "start": "node index.mjs",
     "dry": "node index.mjs --dry",
-    "test": "node test.mjs",
+    "test": "node test.mjs && node test-m02.mjs",
     "survey": "node survey.mjs 60",
-    "check": "node --check index.mjs && node --check survey.mjs && node --check src/feed.mjs && node --check src/decode.mjs && node --check src/matcher.mjs && node --check src/notify.mjs && node --check src/record.mjs && node --check src/solana.mjs"
+    "check": "node --check index.mjs && node --check survey.mjs && node --check src/feed.mjs && node --check src/decode.mjs && node --check src/matcher.mjs && node --check src/notify.mjs && node --check src/record.mjs && node --check src/solana.mjs && node --check src/policy.mjs && node --check src/sellability.mjs"
   },
   "dependencies": { "ethers": "^6.13.0" }
 }
