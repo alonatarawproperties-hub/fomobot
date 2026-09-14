@@ -52,6 +52,12 @@ const big = (v) => { try { return BigInt(v); } catch { return null; } };
 /**
  * Guard a build response before anything is signed. Pure.
  *
+ * On success returns `expectedOut` — what the build says we will receive. That
+ * is NOT a slippage floor and must never be used as one: the on-chain minimum
+ * comes from minOutFor() and nowhere else. Naming it `minOut` once already
+ * invited exactly that mistake, whose failure mode is a bad fill rather than an
+ * error, so nothing would surface it.
+ *
  * @param {object} build  the `data` object from /route/build
  * @param {object} quote  the routeSummary the build was derived from
  * @param {object} limits { maxOutputDriftBps, router }
@@ -71,8 +77,8 @@ export function verifyBuild(build, quote, limits = {}) {
   if (typeof data !== 'string' || data.length === 0) {
     return { ok: false, reason: REFUSE_BUILD.NO_CALLDATA, detail: null };
   }
-  // A selector plus at least one word. Cheap, but it catches a truncated or
-  // error-shaped body being signed as if it were a swap.
+  // A selector (10 chars) plus at least one 32-byte word (64) = 74. Cheap, but
+  // it catches a truncated or error-shaped body being signed as if it were a swap.
   if (!/^0x[0-9a-fA-F]{8,}$/.test(data) || data.length < 74 || data.length % 2 !== 0) {
     return { ok: false, reason: REFUSE_BUILD.BAD_CALLDATA, detail: data.slice(0, 12) };
   }
@@ -90,14 +96,14 @@ export function verifyBuild(build, quote, limits = {}) {
     if (driftBps > maxDriftBps) {
       return { ok: false, reason: REFUSE_BUILD.OUTPUT_DRIFT, detail: driftBps };
     }
-    return { ok: true, driftBps, minOut: built };
+    return { ok: true, driftBps, expectedOut: built };
   }
 
-  return { ok: true, driftBps: 0, minOut: built };
+  return { ok: true, driftBps: 0, expectedOut: built };
 }
 
 /**
- * Worst acceptable output for a given slippage, used as the on-chain floor.
+ * Worst acceptable output for a given slippage — the on-chain floor.
  * Computed here rather than trusted from the response: the whole point of a
  * minimum is that WE choose it.
  */

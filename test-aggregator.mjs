@@ -6,9 +6,11 @@ import { verifyBuild, minOutFor, quoteSwap, buildSwap, KYBER, REFUSE_BUILD } fro
 let pass = 0;
 const ok = (n) => { console.log(`  ok  ${n}`); pass++; };
 
-// The real shape, from Robinhood Chain on 2026-09-14.
+// The real shape, from Robinhood Chain on 2026-09-14. The live response's
+// calldata was 5194 chars; this fixture is the same shape at 5180, which is all
+// the length checks care about.
 const REAL_OUT = '3082376340462637678591';
-const CALLDATA = '0xe21fd0e9' + 'ab'.repeat(2585); // 5194 chars, as measured
+const CALLDATA = '0xe21fd0e9' + 'ab'.repeat(2585);
 const quote = (amountOut = REAL_OUT) => ({ amountIn: '10000000', amountOut });
 const build = (over = {}) => ({
   routerAddress: '0x6131B5fae19EA4f9D964eAc0408E4408b66337b5',
@@ -23,7 +25,8 @@ console.log('\naggregator guard');
   const v = verifyBuild(build(), quote());
   assert.equal(v.ok, true);
   assert.equal(v.driftBps, 0);
-  assert.equal(v.minOut, BigInt(REAL_OUT));
+  assert.equal(v.expectedOut, BigInt(REAL_OUT));
+  assert.equal('minOut' in v, false); // expectedOut is not a floor and must not read as one
   ok('the real build passes, case-insensitively on the router');
 }
 {
@@ -54,8 +57,8 @@ console.log('\naggregator guard');
   const v = verifyBuild(build({ amountOut: slightlyWorse.toString() }), quote());
   assert.equal(v.ok, true);
   assert.equal(v.driftBps, 100);
-  assert.equal(v.minOut, slightlyWorse); // the floor follows the BUILD, not the quote
-  ok('normal drift is allowed and the floor tracks the build');
+  assert.equal(v.expectedOut, slightlyWorse); // follows the BUILD, not the quote
+  ok('normal drift is allowed and the expectation tracks the build');
 }
 {
   const muchWorse = (BigInt(REAL_OUT) * 9000n) / 10_000n; // -10%
@@ -73,7 +76,7 @@ console.log('\naggregator guard');
   const v = verifyBuild(build({ amountOut: better.toString() }), quote());
   assert.equal(v.ok, true);
   assert.equal(v.driftBps, 0);
-  assert.equal(v.minOut, better);
+  assert.equal(v.expectedOut, better);
   ok('a better-than-quoted build is never refused');
 }
 {
@@ -138,3 +141,4 @@ console.log('\nclient');
 }
 
 console.log(`\n${pass} passed\n`);
+}
