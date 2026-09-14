@@ -40,6 +40,33 @@ export function parseCommand(text) {
 }
 
 /**
+ * Is this message left over from before the bot started?
+ *
+ * Telegram holds undelivered updates for 24 hours, so a bot that has been down
+ * replays everything it missed the moment it comes up — and a `/resume` sent
+ * yesterday acting today is the dangerous direction of that.
+ *
+ * This is decided by the message's OWN timestamp. The first implementation
+ * instead discarded whatever the first poll returned, which was wrong in a way
+ * that made the feature look broken rather than unsafe: the empty-result check
+ * ran before the offset was set, so an idle first poll left the offset unset and
+ * the NEXT batch — arriving minutes later and containing a real command — was
+ * still treated as the backlog. The first command ever sent was always eaten.
+ *
+ * The grace window covers clock skew between Telegram and this box, and means a
+ * command sent during a restart is honoured rather than silently dropped. It is
+ * far too short to resurrect a stale instruction.
+ *
+ * A message with no timestamp is treated as current: dropping a real command is
+ * the more annoying failure, and the update offset already prevents repeats.
+ */
+export function isStale(message, startedAtMs, graceMs = 30_000) {
+  const date = message?.date;
+  if (typeof date !== 'number' || !Number.isFinite(date)) return false;
+  return date * 1000 < startedAtMs - graceMs;
+}
+
+/**
  * May this message command the bot?
  *
  * String comparison on purpose: a Telegram chat id is a 64-bit integer, and both

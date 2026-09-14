@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync, rmSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseCommand, isAuthorized, decideCommand } from './src/control.mjs';
+import { parseCommand, isAuthorized, decideCommand, isStale } from './src/control.mjs';
 import { loadControlState, saveControlState } from './src/control-io.mjs';
 
 let pass = 0;
@@ -79,6 +79,42 @@ console.log('\nauthorisation');
   assert.equal(isAuthorized({ chat: { id: a } }, b), false);
   assert.equal(isAuthorized({ chat: { id: a } }, a), true);
   ok('two ids that collide as numbers are still told apart');
+}
+
+console.log('\nstale messages');
+
+const START = 1_700_000_000_000; // ms
+const at = (ms) => ({ date: Math.floor(ms / 1000) });
+
+{
+  // The bug this replaced: the backlog was decided by which POLL a message
+  // arrived in, and an idle first poll left the offset unset -- so the next
+  // batch, minutes later and carrying a real command, was still discarded. The
+  // first command ever sent was always eaten, which is exactly what a user sees
+  // as "no response".
+  assert.equal(isStale(at(START + 60_000), START), false, 'sent after startup');
+  assert.equal(isStale(at(START), START), false, 'sent exactly at startup');
+  assert.equal(isStale(at(START - 5_000), START), false, 'sent during a restart, inside the grace');
+  assert.equal(isStale(at(START - 86_400_000), START), true, 'sent yesterday');
+  ok('staleness is decided by when the message was sent, not which poll saw it');
+}
+{
+  // The grace window must be short enough that it cannot resurrect an old
+  // instruction -- a /resume from yesterday acting today is the dangerous
+  // direction of replaying a backlog.
+  assert.equal(isStale(at(START - 29_000), START), false);
+  assert.equal(isStale(at(START - 31_000), START), true);
+  assert.equal(isStale(at(START - 31_000), START, 0), true);
+  ok('the grace window covers a restart and nothing longer');
+}
+{
+  // A missing timestamp is treated as current: dropping a real command is the
+  // more annoying failure, and the update offset already prevents repeats.
+  assert.equal(isStale({}, START), false);
+  assert.equal(isStale({ date: null }, START), false);
+  assert.equal(isStale({ date: 'soon' }, START), false);
+  assert.equal(isStale(null, START), false);
+  ok('a message with no usable timestamp is processed rather than dropped');
 }
 
 console.log('\ndecisions');
@@ -188,6 +224,18 @@ assert.ok(INDEX.length > 2000, 'index.mjs stripped to nothing');
   assert.match(INDEX, /chatId:\s*config\.telegram\.chatId/);
   assert.ok(!/isAuthorized\s*\([^)]*true/.test(INDEX), 'authorisation is never short-circuited');
   ok('only the configured chat is allowed to command the bot');
+}
+{
+  // The offset must advance for every batch. Setting it after an early return is
+  // what made the first command vanish.
+  const CIO = stripComments(readFileSync(new URL('./src/control-io.mjs', import.meta.url), 'utf8'));
+  const setOffset = CIO.indexOf('offset = Math.max(');
+  const loopStart = CIO.indexOf('for (const update of updates)');
+  assert.ok(setOffset > 0 && loopStart > 0);
+  assert.ok(setOffset < loopStart, 'the offset is advanced before any message is handled');
+  assert.ok(!/const firstPoll/.test(CIO), 'the poll-count heuristic must not come back');
+  assert.match(CIO, /isStale\(message, startedAt\)/);
+  ok('the backlog is judged by timestamp, and the offset always advances');
 }
 {
   const saves = [...INDEX.matchAll(/saveControlState\s*\(/g)];

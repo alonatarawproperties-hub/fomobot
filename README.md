@@ -371,11 +371,18 @@ is watching.
 reply says so, because the gap between what pause does and what someone reaching
 for it in a hurry assumes it does is where money is lost.
 
-The startup backlog is discarded: Telegram holds undelivered updates for 24 hours,
-so a bot that has been down replays everything it missed — and a `/resume` sent
-yesterday acting today is the dangerous direction of that. Commands are momentary;
-the durable part is the persisted pause. Every accepted command replies, so one
-dropped during a restart shows up as silence.
+**Stale commands are discarded by their own timestamp**, not by which poll saw
+them. Telegram holds undelivered updates for 24 hours, so a bot that has been down
+replays everything it missed — and a `/resume` sent yesterday acting today is the
+dangerous direction of that. The 30-second grace covers clock skew and means a
+command sent *during* a restart is still honoured.
+
+The first version decided this by poll instead, and it was wrong in a way that
+made the feature look broken rather than unsafe: the empty-result check ran before
+the update offset was set, so an idle first poll left the offset unset and the
+next batch — arriving minutes later with a real command in it — was still treated
+as the backlog. **The first command ever sent was always eaten.** Found by sending
+`/help` to a freshly started bot and getting silence.
 
 ## Run it
 
@@ -384,7 +391,7 @@ Needs Node 22+ (for the built-in WebSocket).
 ```sh
 npm install
 cp config.example.json config.json   # fill in Helius, Telegram, and the executor block
-npm test                             # 162 offline assertions, no network
+npm test                             # 166 offline assertions, no network
 npm run paper                        # detect + decide + simulate, sign nothing
 npm start
 ```

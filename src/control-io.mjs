@@ -18,7 +18,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { parseCommand, isAuthorized, decideCommand } from './control.mjs';
+import { parseCommand, isAuthorized, decideCommand, isStale } from './control.mjs';
 
 const API = 'https://api.telegram.org';
 
@@ -52,8 +52,8 @@ export function saveControlState(path, state) {
  * @param {(action:string) => void} opts.onAction
  * @param {(msg:string, extra?:object) => void} opts.log
  */
-export function startControl({ botToken, chatId, snapshot, onAction, log = () => {} }) {
-  const stats = { polls: 0, commands: 0, rejected: 0, errors: 0, conflicts: 0, apiRefusals: 0 };
+export function startControl({ botToken, chatId, snapshot, onAction, log = () => {}, startedAt = Date.now() }) {
+  const stats = { polls: 0, commands: 0, rejected: 0, errors: 0, conflicts: 0, apiRefusals: 0, stale: 0 };
   let offset = null;
   let stopped = false;
 
@@ -107,16 +107,19 @@ export function startControl({ botToken, chatId, snapshot, onAction, log = () =>
         const updates = body.result ?? [];
         if (!updates.length) continue;
 
-        const firstPoll = offset === null;
+        // Advance the offset for EVERY batch. Doing it after an early return was
+        // the bug that made the first command ever sent disappear.
         offset = Math.max(...updates.map((u) => u.update_id)) + 1;
-        if (firstPoll) {
-          log('discarded backlog from before startup', { count: updates.length });
-          continue;
-        }
 
         for (const update of updates) {
           const message = update?.message ?? update?.edited_message;
           if (!message) continue;
+
+          if (isStale(message, startedAt)) {
+            stats.stale += 1;
+            log('ignored a message from before startup', { sentAt: message.date });
+            continue;
+          }
 
           if (!isAuthorized(message, chatId)) {
             // Deliberately silent. A reply would confirm to anyone probing bot
