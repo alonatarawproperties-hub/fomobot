@@ -1,0 +1,102 @@
+// Offline tests for the Robinhood Chain trade classifier. No chain, no RPC.
+
+import assert from 'node:assert/strict';
+import { erc20Deltas, classifyRhTrade, isRhTrade, TRANSFER_TOPIC } from './src/robinhood-trade.mjs';
+
+let pass = 0;
+const ok = (n) => { console.log(`  ok  ${n}`); pass++; };
+
+const TARGET = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+const RELAYER = '0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f';
+const TWINE = '0xe27501d787d647cc82a5b4a7eafd5750386f1b77';
+const USDG = '0x5fc5360d0400a0fd4f2af552add042d716f1d168';
+const WETH = '0x0bd7d308f8e1639fab988df18a8011f41eacad73';
+const STRANGER = '0x1111111111111111111111111111111111111111';
+
+const word = (addr) => '0x' + '0'.repeat(24) + addr.slice(2).toLowerCase();
+const hex = (n) => '0x' + n.toString(16);
+const xfer = (token, from, to, amount) =>
+  ({ address: token, topics: [TRANSFER_TOPIC, word(from), word(to)], data: hex(amount) });
+const rcpt = (logs, status = '0x1') => ({ status, logs });
+
+console.log('\nrobinhood classifier');
+
+{
+  // The anchor: his real transaction, replayed. Measured on chain 2026-09-14,
+  // not invented — a regression fails against reality rather than my idea of it.
+  const real = rcpt([xfer(TWINE, RELAYER, TARGET, 298050709030015309892142n)]);
+  const t = classifyRhTrade(real, TARGET);
+  assert.equal(t.side, 'buy');
+  assert.equal(t.token, TWINE);
+  assert.equal(t.amount, 298050709030015309892142n);
+  assert.equal(isRhTrade(t), true);
+  ok('his real TWINE buy reads as a buy, to the token');
+}
+{
+  const t = classifyRhTrade(rcpt([
+    xfer(USDG, TARGET, RELAYER, 500_000000n),
+    xfer(TWINE, RELAYER, TARGET, 42n * 10n ** 18n),
+  ]), TARGET);
+  assert.equal(t.side, 'buy');
+  assert.equal(t.token, TWINE); // the non-quote leg decides, not the stablecoin
+  ok('paying in USDG still reads as a buy of the token');
+}
+{
+  const t = classifyRhTrade(rcpt([
+    xfer(TWINE, TARGET, RELAYER, 42n * 10n ** 18n),
+    xfer(WETH, RELAYER, TARGET, 3n * 10n ** 17n),
+  ]), TARGET);
+  assert.equal(t.side, 'sell');
+  assert.equal(t.amount, 42n * 10n ** 18n);
+  ok('a sell reports the amount sold');
+}
+{
+  // Quote-only movement is funding, never a trade — same rule as Solana, where
+  // most of his signatures turned out to be exactly this.
+  const t = classifyRhTrade(rcpt([xfer(USDG, TARGET, RELAYER, 1280_422000n)]), TARGET);
+  assert.equal(t.side, 'funding');
+  assert.equal(t.direction, 'out');
+  assert.equal(isRhTrade(t), false); // the executor must never act on this
+  ok('quote-only movement is funding, not a trade');
+}
+{
+  // 35 logs in the real transaction, only one of them ours. Reading another
+  // party's leg as the target's would invent a trade that never happened.
+  const t = classifyRhTrade(rcpt([
+    xfer(TWINE, RELAYER, STRANGER, 999n * 10n ** 18n),
+    xfer(WETH, STRANGER, RELAYER, 5n * 10n ** 17m ?? 0n),
+  ].filter(Boolean), '0x1'), TARGET);
+  assert.equal(t.side, null);
+  ok('other parties moving in the same transaction are not our trade');
+}
+{
+  // A 2-topic log sharing the Transfer name, and an ERC-721 whose third indexed
+  // topic is a token id — both would misread as a fungible amount.
+  const twoTopic = { address: TWINE, topics: [TRANSFER_TOPIC, word(TARGET)], data: hex(5n) };
+  const erc721 = { address: TWINE, topics: [TRANSFER_TOPIC, word(RELAYER), word(TARGET), word(TARGET)], data: '0x' };
+  assert.deepEqual(erc20Deltas(rcpt([twoTopic, erc721]), TARGET), []);
+  ok('a 2-topic event and an ERC-721 transfer are both ignored');
+}
+{
+  const self = rcpt([xfer(TWINE, TARGET, TARGET, 10n ** 18n)]);
+  assert.deepEqual(erc20Deltas(self, TARGET), []); // nets to zero: not a position change
+  ok('a self-transfer nets to zero');
+}
+{
+  // A reverted transaction still carries logs from before the revert in some
+  // traces; acting on them would be acting on something that did not happen.
+  const reverted = rcpt([xfer(TWINE, RELAYER, TARGET, 10n ** 18n)], '0x0');
+  assert.equal(classifyRhTrade(reverted, TARGET).side, null);
+  // A receipt with no status at all must not be assumed successful.
+  assert.equal(classifyRhTrade({ logs: [xfer(TWINE, RELAYER, TARGET, 1n)] }, TARGET).side, null);
+  ok('a reverted or status-less receipt yields nothing');
+}
+{
+  assert.deepEqual(erc20Deltas(rcpt([]), TARGET), []);
+  assert.deepEqual(erc20Deltas({}, TARGET), []);
+  assert.deepEqual(erc20Deltas(rcpt([xfer(TWINE, RELAYER, TARGET, 1n)]), ''), []);
+  assert.equal(classifyRhTrade(null, TARGET).side, null);
+  ok('empty, malformed and ownerless inputs yield nothing rather than throwing');
+}
+
+console.log(`\n${pass} passed\n`);
