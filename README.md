@@ -135,6 +135,55 @@ build redirected to another recipient → refused: short-receipt (received 0, fl
 Both are needed, and the first belongs to a third party, which is reason enough
 not to rely on it alone.
 
+### One big buy
+
+`sizeUsd 450`, `maxOpenPositions 1`, `useFullBalance true` makes the bot take a
+single position for the whole wallet. Two things measured before choosing that
+shape, because both are counter-intuitive:
+
+**Gas is not a factor and congestion does not change it.** The block gas limit is
+1,125,899,906,842,624 and the busiest block sampled used 14,713,338 — six orders
+of magnitude of headroom. The base fee over 1001 blocks ranged 0.0707–0.0758 gwei,
+a 1.07× spread. And the sequencer is first-come-first-served with **no fee
+bidding**, so paying more cannot buy a better place in the queue. Budget nothing
+for a gas war; there is no auction to win. What competes on a launch is latency.
+
+**Price impact is the real constraint, and it is the quote that carries it.** Same
+token (TRUTH, the thinnest fresh pool sampled 2026-09-14), by size:
+
+```
+  $ 25   -0.56%        $100   -3.62%        $300  -10.88%
+  $ 50   -1.62%        $150   -5.56%        $450  -15.63%   ($70 gone on entry)
+```
+
+Kyber's quoted `amountOut` already includes this, so `slippageBps` is NOT what
+protects against it — slippage only covers movement between the quote and the
+fill, a window of about a second. On a launch with many buyers that window can
+exceed 3%, and the trade then reverts rather than filling badly. A refusal, not a
+loss, but a miss.
+
+### Keeping connections warm — and what is NOT established about it
+
+`warmupMs` (default 15s) probes the aggregator and the RPC on a timer. Its proven
+job is **reachability**: a failing probe says the aggregator is down before a
+signal needs it rather than during one.
+
+It was built for latency, and that part is **not established**. The cold penalty
+is real and measured — 413ms warm against 1631ms after 60s idle — but an
+alternating A/B of the whole buy path came out ambiguous:
+
+```
+off  1506 / 1417 / 1425 / 8252 ms   median 1506
+on   1157 / 1925 / 1566 / 2861 ms   median 1925
+```
+
+Medians favour off; worst cases favour on, and the 8252ms outlier is on the off
+side — exactly the blowup warming is meant to prevent. Four pairs cannot separate
+those. There is also a confound: the box those numbers came from routes HTTPS through a proxy,
+which owns the connection to the aggregator, so a client-side keep-alive cannot
+reach the hop that costs. **A production box with a direct connection has not been
+measured.** Do not repeat the latency claim until it has.
+
 ### Catching a launch
 
 A launch is tradeable the instant its pool is created, but the aggregator has to
@@ -193,6 +242,10 @@ and it should be re-measured on the Ohio VM before anyone decides otherwise.
   "wallet": "0x…",           // the address we trade from
   "quoteToken": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",  // USDG
   "sizeUsd": 25,             // what WE spend per copy — nothing to do with his size
+  "useFullBalance": false,   // treat sizeUsd as a CEILING: spend up to it, or the whole
+                             // balance if that is lower. Off by default, because for a bot
+                             // meant to take several positions "spend it all" is wrong.
+  "warmupMs": 15000,         // keep the aggregator connection hot; 0 disables
   "slippageBps": 300,
   "quoteRetryMs": 15000,     // keep re-asking this long when a pool is too new to route; 0 = ask once
   "maxOpenPositions": 3,
@@ -266,7 +319,7 @@ Needs Node 22+ (for the built-in WebSocket).
 ```sh
 npm install
 cp config.example.json config.json   # fill in Helius, Telegram, and the executor block
-npm test                             # 134 offline assertions, no network
+npm test                             # 140 offline assertions, no network
 npm run paper                        # detect + decide + simulate, sign nothing
 npm start
 ```

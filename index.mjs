@@ -24,9 +24,10 @@ import { Recorder } from './src/record.mjs';
 import { SolanaWatcher, classifyTrade } from './src/solana.mjs';
 import { classifyRhTrade, isRhTrade } from './src/robinhood-trade.mjs';
 import { decideEntry, initialState } from './src/policy.mjs';
-import { executeBuy, quoteUnitsForUsd } from './src/executor.mjs';
-import { makeExecutorDeps, loadPrivateKey, fetchReceipt, KEY_ENV } from './src/executor-io.mjs';
-import { USD_STABLES } from './src/chain/robinhood.mjs';
+import { executeBuy, quoteUnitsForUsd, decideApproval, approvalAmounts, encodeApprove } from './src/executor.mjs';
+import { KYBER } from './src/aggregator.mjs';
+import { makeExecutorDeps, loadPrivateKey, fetchReceipt, startWarmup, KEY_ENV } from './src/executor-io.mjs';
+import { USD_STABLES, ADDRESSES } from './src/chain/robinhood.mjs';
 
 const argv = process.argv.slice(2);
 const flag = (name, fallback = null) => {
@@ -197,6 +198,47 @@ log('info', 'starting', {
     : 'disabled',
 });
 
+// --- pre-approval ------------------------------------------------------------
+// The approve is the slowest thing in the buy path and none of it is work: it is
+// a whole extra transaction that must be MINED before the swap can even be
+// broadcast, which on a launch is the one moment that cost is unaffordable.
+// Granting it at startup moves that cost to a time when nothing is waiting.
+//
+// It stays a BOUNDED approval, which is the property worth keeping. The bound is
+// just stated over the bot's lifetime rather than one trade: `sizeUsd` times
+// `maxOpenPositions` is the most this process can ever spend, so approving that
+// much authorises nothing the position limits did not already permit. With a
+// single-position config the two numbers are identical and nothing is given up
+// at all.
+//
+// Live only. In paper mode there is no key and nothing to approve.
+async function preApproveQuoteToken() {
+  const ex = executor.cfg;
+  const budgetUsd = (ex.sizeUsd ?? 0) * (ex.maxOpenPositions ?? 1);
+  const budget = quoteUnitsForUsd(budgetUsd, executor.quoteToken);
+  if (budget === null) {
+    log('warn', 'pre-approval skipped: budget not expressible in the quote token', { budgetUsd });
+    return;
+  }
+
+  const router = ex.router ?? KYBER.router;
+  const allowance = await execDeps.getAllowance({ token: executor.quoteToken, owner: ex.wallet, spender: router });
+  const mode = decideApproval(allowance, budget);
+  if (mode === 'none') {
+    log('info', 'pre-approval not needed', { allowance: String(allowance), budget: String(budget) });
+    return;
+  }
+
+  for (const amount of approvalAmounts(mode, budget)) {
+    const { hash } = await execDeps.send({ to: executor.quoteToken, data: encodeApprove(router, amount), gasLimit: null });
+    const receipt = await execDeps.waitReceipt(hash);
+    const okStatus = String(receipt?.status).toLowerCase() === '0x1' || receipt?.status === 1;
+    if (!okStatus) throw new Error(`pre-approval reverted (${hash})`);
+    log('info', 'pre-approved', { amount: String(amount), hash });
+  }
+  notifier.send(`\u{1F511} pre-approved <b>$${budgetUsd}</b> of ${esc(executor.stable.symbol)} to the router — the buy path now has no approve step in it`);
+}
+
 // --- copying a Robinhood Chain buy -------------------------------------------
 // The feed sees a transaction before it executes, so the alert above has already
 // gone out by the time any of this runs. What happens here is the decision, and
@@ -291,6 +333,7 @@ async function copyBuy(sig, trade) {
       maxOutputDriftBps: ex.maxOutputDriftBps ?? 300,
       quoteRetryMs: ex.quoteRetryMs ?? 15_000,
       quoteRetryIntervalMs: ex.quoteRetryIntervalMs ?? 1000,
+      useFullBalance: ex.useFullBalance === true,
       paper: executor.paper,
     });
   } catch (err) {
@@ -484,6 +527,41 @@ if (solEntries.length) {
   log('info', 'solana watcher disabled', { reason: 'no solana wallets in roster' });
 }
 
+// --- keep the connections hot ------------------------------------------------
+// The bot idles for hours and then has to be fast once. A cold TLS handshake to
+// the aggregator costs more than every other latency fix here put together — see
+// the measurements in startWarmup. Set executor.warmupMs to 0 to turn it off.
+let warmup = null;
+if (executor.enabled && (executor.cfg.warmupMs ?? 15_000) > 0) {
+  warmup = startWarmup({
+    provider: execDeps.provider,
+    quoteToken: executor.quoteToken,
+    probeToken: ADDRESSES.weth,
+    intervalMs: executor.cfg.warmupMs ?? 15_000,
+    onResult: (st) => {
+      // Only ever logged on a change of state, so a healthy bot stays quiet and a
+      // broken aggregator is visible before a signal needs it rather than after.
+      if (st.lastError && st.failures === 1) log('warn', 'warmup failing — the aggregator may be unreachable', { error: st.lastError });
+    },
+  });
+}
+
+// --- pre-approval at startup -------------------------------------------------
+if (executor.enabled && !executor.paper && execDeps?.signer) {
+  // Through the SAME queue entries use. The feed is already running by the time
+  // this fires, so a signal arriving mid-startup would otherwise have the entry
+  // path and the pre-approval both asking the node for the same pending nonce —
+  // one of the two transactions is then rejected, and the one that loses is
+  // whichever the node happens to see second.
+  serialise(() => preApproveQuoteToken()).catch((err) => {
+    // Not fatal. A failed pre-approval costs latency on the first buy, because
+    // the trade path still approves for itself when the allowance is short — it
+    // does not cost the trade.
+    log('error', 'pre-approval failed, buys will approve inline instead', { error: err?.message ?? String(err) });
+    notifier.send(`\u26A0\uFE0F pre-approval failed — buys still work, but the first one pays for an approve first\n${esc(err?.message ?? '')}`);
+  });
+}
+
 // --- heartbeat ---------------------------------------------------------------
 // Proves liveness even when the roster is quiet, so "nothing happened" is always
 // distinguishable from "nothing is running".
@@ -495,6 +573,7 @@ const heartbeat = setInterval(() => {
     recordErrors: recorder.errors,
     alertsDropped: notifier.dropped,
     executor: executor.enabled ? { mode: executor.paper ? 'paper' : 'live', ...execStats, open: policyState.openCount } : 'disabled',
+    warmup: warmup ? { ...warmup.stats } : 'off',
   });
 }, config.heartbeatMs ?? 60_000);
 
@@ -505,6 +584,7 @@ async function shutdown(signal) {
   closing = true;
   log('info', 'shutting down', { signal, rh: feed?.stats, solana: sol?.stats });
   clearInterval(heartbeat);
+  warmup?.stop();
   feed?.stop();
   sol?.stop();
   await recorder.close();

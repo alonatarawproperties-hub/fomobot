@@ -419,18 +419,20 @@ function fakeDeps(over = {}) {
   const record = (name, fn) => async (...args) => { calls.push({ name, args }); return fn(...args); };
   const deps = {
     calls,
-    getTokenBalance: record('getTokenBalance', async () => over.inputBalance ?? 10_000n),
+    // `in` rather than `??`: an override OF null is the whole point of some cases,
+    // and `null ?? default` quietly hands back the default instead.
+    getTokenBalance: record('getTokenBalance', async () => ('inputBalance' in over ? over.inputBalance : 10_000n)),
     quote: record('quote', async () => over.quote ?? { amountOut: '3000' }),
     build: record('build', async () => over.build ?? { routerAddress: ROUTER, data: CALLDATA, amountOut: '3000' }),
-    getAllowance: record('getAllowance', async () => over.allowance ?? 0n),
+    getAllowance: record('getAllowance', async () => ('allowance' in over ? over.allowance : 0n)),
     simulate: record('simulate', async ({ calls: c }) => {
       if (over.simulate) return over.simulate(c);
       const index = { preIn: 0, preOut: 1, approvals: [], swap: c.length - 3, postIn: c.length - 2, postOut: c.length - 1 };
       for (let i = 2; i < index.swap; i++) index.approvals.push(i);
       return simFor(index, { preIn: 10_000n, preOut: 0n, postIn: 9_500n, postOut: 3_000n });
     }),
-    getGasPrice: record('getGasPrice', async () => over.gasPrice ?? 100_000_000n),
-    getNativeBalance: record('getNativeBalance', async () => over.nativeBalance ?? 10n ** 18n),
+    getGasPrice: record('getGasPrice', async () => ('gasPrice' in over ? over.gasPrice : 100_000_000n)),
+    getNativeBalance: record('getNativeBalance', async () => ('nativeBalance' in over ? over.nativeBalance : 10n ** 18n)),
     send: record('send', async () => ({ hash: '0x' + 'ab'.repeat(32) })),
     waitReceipt: record('waitReceipt', async () => over.receipt ?? { status: '0x1' }),
   };
@@ -556,6 +558,16 @@ const named = (deps, name) => deps.calls.filter((c) => c.name === name);
   ok('a trade we cannot fund is refused before anything is quoted');
 }
 {
+  for (const [over, name] of [[{ inputBalance: null }, 'tokenBalance'], [{ nativeBalance: undefined }, 'nativeBalance']]) {
+    const deps = fakeDeps(over);
+    const r = await executeBuy(deps, params());
+    assert.equal(r.reason, REFUSE_SEND.READ_UNREADABLE, name);
+    assert.equal(r.detail, name);
+    assert.equal(named(deps, 'send').length, 0);
+  }
+  ok('a read that will not parse refuses as unreadable, not as an empty wallet');
+}
+{
   const deps = fakeDeps({ nativeBalance: 1n });
   const r = await executeBuy(deps, params());
   assert.equal(r.reason, REFUSE_SEND.NO_GAS_BALANCE);
@@ -645,6 +657,74 @@ const named = (deps, name) => deps.calls.filter((c) => c.name === name);
   ok('a token that never routes refuses cleanly and sends nothing');
 }
 
+console.log('\nsizing against the wallet, and read concurrency');
+
+{
+  // The brittleness this exists for: a configured size equal to the balance
+  // refuses outright the moment the balance is a fraction short, and the trade it
+  // refuses is the one the operator was waiting for.
+  const deps = fakeDeps({ inputBalance: 449_990_000n });
+  const r = await executeBuy(deps, params({ amountIn: 450_000_000n, useFullBalance: true, paper: true }));
+  assert.equal(r.ok, true);
+  assert.equal(r.plan.amountIn, '449990000', 'spent what the wallet actually held');
+  assert.equal(r.plan.walletBalance, '449990000');
+  const quoted = named(deps, 'quote')[0].args[0];
+  assert.equal(quoted.amountIn, '449990000', 'and quoted for that amount, not the configured one');
+  ok('useFullBalance spends the balance when it falls short of the configured size');
+}
+{
+  // It is a CEILING, not "spend everything": a bigger balance does not make a
+  // bigger trade.
+  const deps = fakeDeps({ inputBalance: 10_000_000_000n });
+  const r = await executeBuy(deps, params({ amountIn: 450_000_000n, useFullBalance: true, paper: true }));
+  assert.equal(r.plan.amountIn, '450000000');
+  ok('useFullBalance never spends more than the configured size');
+}
+{
+  const deps = fakeDeps({ inputBalance: 449_990_000n });
+  const r = await executeBuy(deps, params({ amountIn: 450_000_000n, paper: true }));
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, REFUSE_SEND.NO_INPUT_BALANCE);
+  ok('without the flag a short balance still refuses, unchanged');
+}
+{
+  const deps = fakeDeps({ inputBalance: 0n });
+  const r = await executeBuy(deps, params({ amountIn: 450_000_000n, useFullBalance: true }));
+  assert.equal(r.ok, false);
+  assert.equal(named(deps, 'send').length, 0);
+  ok('an empty wallet refuses rather than trading nothing');
+}
+{
+  // The four chain reads are independent of each other, and fetching them one at
+  // a time cost ~290ms of a ~1340ms path. This asserts they actually overlap: if
+  // any is awaited before the next starts, peak concurrency drops to 1.
+  let live = 0, peak = 0;
+  const slow = async (v) => {
+    live++; peak = Math.max(peak, live);
+    await new Promise((r) => setTimeout(r, 5));
+    live--; return v;
+  };
+  const deps = fakeDeps();
+  Object.assign(deps, {
+    getTokenBalance: () => slow(10_000n),
+    getAllowance: () => slow(0n),
+    getGasPrice: () => slow(100_000_000n),
+    getNativeBalance: () => slow(10n ** 18n),
+  });
+  await executeBuy(deps, params({ paper: true }));
+  assert.equal(peak, 4, `expected all four reads in flight together, peaked at ${peak}`);
+  ok('the four chain reads are fetched together, not one after another');
+}
+{
+  // Parallel fetching must not reorder REFUSALS. An unfundable trade still costs
+  // no aggregator call, which is the property the ordering was for.
+  const deps = fakeDeps({ inputBalance: 1n });
+  const r = await executeBuy(deps, params());
+  assert.equal(r.reason, REFUSE_SEND.NO_INPUT_BALANCE);
+  assert.equal(named(deps, 'quote').length, 0);
+  ok('fetching in parallel did not reorder the refusals');
+}
+
 console.log('\nwiring (read as source)');
 
 // These read index.mjs rather than calling anything, because no unit assertion
@@ -667,6 +747,15 @@ assert.ok(INDEX.length > 2000, 'index.mjs stripped to nothing — the comment st
   assert.equal(sites.length, 2, 'expected exactly one definition and one call site for copyBuy');
   assert.match(INDEX, /serialise\(\(\)\s*=>\s*copyBuy\(/, 'the entry path must go through serialise');
   ok('entries are serialised, so two buys cannot race the nonce or the position limit');
+}
+{
+  // The pre-approval sends a transaction, and the feed is already running when it
+  // fires. Outside the entry queue it races an early signal for the same nonce.
+  assert.match(INDEX, /serialise\(\(\)\s*=>\s*preApproveQuoteToken\(\)\)/,
+    'pre-approval must go through the same queue as entries');
+  const sites = [...INDEX.matchAll(/preApproveQuoteToken\s*\(/g)];
+  assert.equal(sites.length, 2, 'one definition, one call site');
+  ok('startup pre-approval shares the entry queue, so it cannot race a signal for the nonce');
 }
 {
   // Dedupe must happen BEFORE the receipt is fetched, or a replayed frame has
