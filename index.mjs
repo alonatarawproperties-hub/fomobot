@@ -289,6 +289,8 @@ async function copyBuy(sig, trade) {
       amountIn,
       slippageBps: ex.slippageBps ?? 300,
       maxOutputDriftBps: ex.maxOutputDriftBps ?? 300,
+      quoteRetryMs: ex.quoteRetryMs ?? 15_000,
+      quoteRetryIntervalMs: ex.quoteRetryIntervalMs ?? 1000,
       paper: executor.paper,
     });
   } catch (err) {

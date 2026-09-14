@@ -135,6 +135,32 @@ build redirected to another recipient → refused: short-receipt (received 0, fl
 Both are needed, and the first belongs to a third party, which is reason enough
 not to rely on it alone.
 
+### Catching a launch
+
+A launch is tradeable the instant its pool is created, but the aggregator has to
+index it first — so asking once means asking at exactly the wrong moment. Measured
+2026-09-14 by watching pools from the block they were created in and polling until
+a USDG route appeared:
+
+```
+BLAST 1s · SYNAPSE 1s · Starlink 1s · SUSUTA 1s · NFS 2s · PNL 3s · TRUTH 4s · SKNT 7s
+```
+
+Seconds, not minutes — so `quoteRetryMs` (default 15s) re-asks until it routes.
+That is what makes a launch catchable at all: his followers act in 3–60 seconds,
+so arriving at 7 is still ahead of them, and arriving never is not.
+
+Two costs, neither hidden. Entries are serialised, so a token that never routes
+holds the queue for the whole window — the uncommon case, and the common one
+returns on the first attempt having slept not at all. And a fill 7 seconds into a
+launch is worse than one at 1 second; the window is configurable because that
+trade — price against getting in at all — is an operator's call. Set it to `0` for
+the old ask-once behaviour.
+
+Not every no-route is lag. **T1**, sampled the same day, never routed: a pool
+paired against native ETH with **3 transfers in its entire existence**. Nothing
+can buy it, us included, and refusing is correct rather than a miss.
+
 ### Latency
 
 Warm path, measured from a proxied box outside the target region:
@@ -168,6 +194,7 @@ and it should be re-measured on the Ohio VM before anyone decides otherwise.
   "quoteToken": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",  // USDG
   "sizeUsd": 25,             // what WE spend per copy — nothing to do with his size
   "slippageBps": 300,
+  "quoteRetryMs": 15000,     // keep re-asking this long when a pool is too new to route; 0 = ask once
   "maxOpenPositions": 3,
   "cooldownMs": 60000,
   "denylistTokens": []
@@ -239,7 +266,7 @@ Needs Node 22+ (for the built-in WebSocket).
 ```sh
 npm install
 cp config.example.json config.json   # fill in Helius, Telegram, and the executor block
-npm test                             # 126 offline assertions, no network
+npm test                             # 134 offline assertions, no network
 npm run paper                        # detect + decide + simulate, sign nothing
 npm start
 ```

@@ -363,6 +363,56 @@ export function decimalString(n) {
 }
 
 /**
+ * Quote, retrying while the aggregator has not caught up with the chain yet.
+ *
+ * A launch is tradeable the instant its pool is created, but KyberSwap has to
+ * index it first, and asking once means asking at exactly the wrong moment.
+ * MEASURED 2026-09-14 by watching pools from the block they were created in and
+ * polling until a USDG route appeared: BLAST 1s, SYNAPSE 1s, Starlink 1s,
+ * SUSUTA 1s, NFS 2s, PNL 3s, TRUTH 4s, SKNT 7s. So the gap is seconds, and a
+ * short retry closes it.
+ *
+ * It is bounded by WALL CLOCK rather than by a number of attempts, because the
+ * question being answered is "how late am I willing to be", not "how many times
+ * am I willing to ask". A window of zero means ask once, which is the old
+ * behaviour and remains available.
+ *
+ * TWO THINGS THIS COSTS, neither of them hidden:
+ *   - Entries are serialised, so a token that never routes holds the queue for
+ *     the whole window. That is the uncommon case (a pool with no liquidity, see
+ *     the T1 measurement in the README) and the common one returns on the first
+ *     attempt having slept not at all.
+ *   - A fill 7 seconds into a launch is a worse fill than one at 1 second. The
+ *     window is configurable for exactly that reason: it trades price against
+ *     the chance of getting in at all, and which side of that you want is an
+ *     operator decision, not ours.
+ */
+export async function quoteWithRetry(deps, params, { windowMs = 15_000, intervalMs = 1000 } = {}) {
+  const now = deps.now ?? (() => Date.now());
+  const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const started = now();
+  const deadline = started + Math.max(0, windowMs);
+
+  let attempts = 0;
+  let lastError = null;
+  for (;;) {
+    attempts += 1;
+    try {
+      const route = await deps.quote(params);
+      // quoteSwap throws on a refusal, so reaching here with no amountOut means
+      // a well-formed response describing no trade. Both are retryable: a pool
+      // that is not indexed yet answers exactly like one that does not exist.
+      if (route?.amountOut) return { ok: true, route, attempts, elapsedMs: now() - started };
+      lastError = 'route had no amountOut';
+    } catch (err) {
+      lastError = err?.message ?? String(err);
+    }
+    if (now() >= deadline) return { ok: false, attempts, lastError, elapsedMs: now() - started };
+    await sleep(intervalMs);
+  }
+}
+
+/**
  * Quote, build, verify, simulate, and only then send.
  *
  * Every network call is injected. That is not test ceremony: it is what lets the
@@ -390,6 +440,8 @@ export async function executeBuy(deps, {
   deadlineSecs = 120,
   gasBufferBps = 2500,
   maxOutputDriftBps = 300,
+  quoteRetryMs = 15_000,
+  quoteRetryIntervalMs = 1000,
   now = Date.now(),
 }) {
   for (const [name, value] of [['wallet', wallet], ['tokenIn', tokenIn], ['tokenOut', tokenOut], ['router', router]]) {
@@ -407,8 +459,18 @@ export async function executeBuy(deps, {
     return refuse(REFUSE_SEND.NO_INPUT_BALANCE, { have: String(inputBalance), need: String(amountIn) });
   }
 
-  const routeSummary = await deps.quote({ tokenIn, tokenOut, amountIn: amountIn.toString() });
-  if (!routeSummary?.amountOut) return refuse(REFUSE_SEND.NO_QUOTE, null);
+  const quoted = await quoteWithRetry(
+    deps,
+    { tokenIn, tokenOut, amountIn: amountIn.toString() },
+    { windowMs: quoteRetryMs, intervalMs: quoteRetryIntervalMs },
+  );
+  if (!quoted.ok) {
+    // A refusal, not a throw. quoteSwap throws on "route not found", and letting
+    // that escape made an ordinary unroutable token look like a crash in the
+    // executor rather than a decision it had made.
+    return refuse(REFUSE_SEND.NO_QUOTE, { attempts: quoted.attempts, elapsedMs: quoted.elapsedMs, lastError: quoted.lastError });
+  }
+  const routeSummary = quoted.route;
 
   // Our floor, from the QUOTE. Taking it from the build would let the build move
   // the bar it is being measured against.
@@ -470,6 +532,8 @@ export async function executeBuy(deps, {
     router: lower(router),
     slippageBps,
     driftBps: checked.driftBps,
+    quoteAttempts: quoted.attempts,
+    quoteElapsedMs: quoted.elapsedMs,
     swapGasLimit: String(swapGasLimit),
     approvalGasLimits: approvalGasLimits.map(String),
     gasPriceWei: String(gasPrice),

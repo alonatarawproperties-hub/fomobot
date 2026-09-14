@@ -11,7 +11,7 @@ import { id } from 'ethers';
 import {
   SELECTOR, REFUSE_SEND, encodeApprove, encodeBalanceOf, encodeAllowance, decodeUint,
   decodeQuantity, decideApproval, approvalAmounts, buildSimulationCalls, readSimulation,
-  verifySimulation, gasWithBuffer, quoteUnitsForUsd, decimalString, executeBuy,
+  verifySimulation, gasWithBuffer, quoteUnitsForUsd, decimalString, quoteWithRetry, executeBuy,
 } from './src/executor.mjs';
 import { USD_STABLES } from './src/chain/robinhood.mjs';
 import { KYBER } from './src/aggregator.mjs';
@@ -323,6 +323,94 @@ const goodSim = { ok: true, spent: 500n, received: 3000n, swapGas: 400000n, appr
   ok('the gas buffer is applied, and an absent figure is null rather than zero');
 }
 
+console.log('\nquote retry');
+
+/** A fake clock, so the window can be exercised without waiting on one. */
+function fakeClock() {
+  let t = 1_000_000;
+  return { now: () => t, sleep: async (ms) => { t += ms; }, advance: (ms) => { t += ms; } };
+}
+
+{
+  const clock = fakeClock();
+  let calls = 0;
+  const r = await quoteWithRetry(
+    { ...clock, quote: async () => { calls++; return { amountOut: '500' }; } },
+    {}, { windowMs: 15_000, intervalMs: 1000 },
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.attempts, 1);
+  assert.equal(r.elapsedMs, 0);
+  assert.equal(calls, 1);
+  ok('a pool the aggregator already knows costs one call and no delay at all');
+}
+{
+  // The launch case: the pool exists on chain, the aggregator catches up a few
+  // seconds later. Measured range was 1-7s.
+  const clock = fakeClock();
+  let calls = 0;
+  const r = await quoteWithRetry(
+    { ...clock, quote: async () => { calls++; if (calls < 4) throw new Error('route not found'); return { amountOut: '500' }; } },
+    {}, { windowMs: 15_000, intervalMs: 1000 },
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.attempts, 4);
+  assert.equal(r.elapsedMs, 3000);
+  ok('a pool indexed a few seconds late is still caught');
+}
+{
+  const clock = fakeClock();
+  let calls = 0;
+  const r = await quoteWithRetry(
+    { ...clock, quote: async () => { calls++; throw new Error('route not found'); } },
+    {}, { windowMs: 5_000, intervalMs: 1000 },
+  );
+  assert.equal(r.ok, false);
+  assert.equal(r.lastError, 'route not found');
+  assert.ok(r.elapsedMs <= 5000, `gave up inside the window, waited ${r.elapsedMs}`);
+  assert.equal(calls, r.attempts);
+  ok('a token that never routes gives up inside its window and says why');
+}
+{
+  // Zero means ask once: the behaviour before the retry existed, still reachable
+  // for an operator who would rather miss a launch than fill late into one.
+  const clock = fakeClock();
+  let calls = 0;
+  const r = await quoteWithRetry(
+    { ...clock, quote: async () => { calls++; throw new Error('nope'); } },
+    {}, { windowMs: 0, intervalMs: 1000 },
+  );
+  assert.equal(r.attempts, 1);
+  assert.equal(calls, 1);
+  assert.equal(r.ok, false);
+  ok('a zero window asks exactly once');
+}
+{
+  // A well-formed response describing no trade is retried too: an unindexed pool
+  // and a nonexistent one answer the same way, and only time tells them apart.
+  const clock = fakeClock();
+  let calls = 0;
+  const r = await quoteWithRetry(
+    { ...clock, quote: async () => { calls++; return calls < 3 ? { amountOut: null } : { amountOut: '7' }; } },
+    {}, { windowMs: 15_000, intervalMs: 1000 },
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.attempts, 3);
+  ok('an empty route is retried, not treated as a final answer');
+}
+{
+  // Bounded by the clock, not by a count: a slow aggregator must not buy extra
+  // attempts by being slow.
+  const clock = fakeClock();
+  const r = await quoteWithRetry(
+    { ...clock, quote: async () => { clock.advance(4000); throw new Error('slow and empty'); } },
+    {}, { windowMs: 10_000, intervalMs: 1000 },
+  );
+  assert.equal(r.ok, false);
+  assert.equal(r.attempts, 3, 'three slow attempts fill the window, not ten fast ones');
+  ok('the window is wall clock, so slow attempts do not get extra tries');
+}
+
 console.log('\nexecuteBuy');
 
 /** Recording fakes. Every call is logged so ORDER can be asserted, not just count. */
@@ -525,6 +613,36 @@ const named = (deps, name) => deps.calls.filter((c) => c.name === name);
   assert.equal(new Roster([checksummed]).list()[0].handle, handleFor(checksummed));
   assert.equal(handleFor({ handle: 'named', address: '0xAB'.padEnd(42, '0') }), 'named');
   ok('a roster entry has exactly one name, derived in exactly one place');
+}
+
+{
+  const clock = fakeClock();
+  let calls = 0;
+  const deps = fakeDeps();
+  Object.assign(deps, clock, {
+    quote: async () => { calls++; if (calls < 3) throw new Error('route not found'); return { amountOut: '3000' }; },
+  });
+  const r = await executeBuy(deps, params({ paper: true }));
+  assert.equal(r.ok, true);
+  assert.equal(r.plan.quoteAttempts, 3);
+  assert.equal(r.plan.quoteElapsedMs, 2000);
+  ok('executeBuy rides out the aggregator lag on a fresh launch');
+}
+{
+  // A token with no liquidity never routes. It must read as a refusal the caller
+  // can act on, not as a thrown error -- quoteSwap throws on "route not found",
+  // and letting that escape made an ordinary skip look like the executor
+  // crashing.
+  const clock = fakeClock();
+  const deps = fakeDeps();
+  Object.assign(deps, clock, { quote: async () => { throw new Error('route not found'); } });
+  const r = await executeBuy(deps, params({ quoteRetryMs: 5000 }));
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, REFUSE_SEND.NO_QUOTE);
+  assert.equal(r.detail.lastError, 'route not found');
+  assert.ok(r.detail.attempts > 1);
+  assert.equal(named(deps, 'send').length, 0);
+  ok('a token that never routes refuses cleanly and sends nothing');
 }
 
 console.log('\nwiring (read as source)');

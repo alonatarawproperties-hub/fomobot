@@ -44,6 +44,7 @@ config.executor = {
   sizeUsd: 25,
   slippageBps: 300,
   maxOutputDriftBps: 300,
+  quoteRetryMs: 15000,
   maxOpenPositions: 3,
   cooldownMs: 60000,
   denylistTokens: [],
