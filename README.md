@@ -187,6 +187,36 @@ which does not throw, it just trades where nobody is looking.
 `--paper` on the command line forces paper regardless of the file. There is
 deliberately no flag in the other direction.
 
+### Making the wallet
+
+```sh
+npm run new-wallet      # prints an address and a key, writes nothing to disk
+```
+
+Use a **fresh** wallet, not one you already hold funds in. The key has to live on
+the server, so whatever is in that wallet is the most you can lose if the server
+is ever compromised — and the position limits mean it only ever needs
+`sizeUsd × maxOpenPositions` plus gas.
+
+The key goes in a root-only env file and is pointed at from the unit, so it never
+appears on a command line where `ps` would show it to every user on the box:
+
+```sh
+sudo install -m 600 /dev/null /etc/firstfill.env
+sudo tee /etc/firstfill.env >/dev/null <<'ENV'
+FIRSTFILL_PRIVATE_KEY=0x…
+ENV
+```
+
+```ini
+[Service]
+EnvironmentFile=/etc/firstfill.env
+```
+
+Never paste a key into a chat, an issue, a commit, or `config.json`. The bot
+refuses to start if it finds one in the config, and `config.json` is gitignored —
+but neither of those helps once a key has been pasted somewhere that keeps logs.
+
 **Paper mode still needs the wallet funded.** The simulation reads real balances,
 so a dry run from an empty wallet refuses at `insufficient-input-balance` and
 proves nothing. A paper run against a funded wallet is a full rehearsal: quote,
