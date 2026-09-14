@@ -64,8 +64,8 @@ console.log('\nrobinhood classifier');
   // party's leg as the target's would invent a trade that never happened.
   const t = classifyRhTrade(rcpt([
     xfer(TWINE, RELAYER, STRANGER, 999n * 10n ** 18n),
-    xfer(WETH, STRANGER, RELAYER, 5n * 10n ** 17m ?? 0n),
-  ].filter(Boolean), '0x1'), TARGET);
+    xfer(WETH, STRANGER, RELAYER, 5n * 10n ** 17n),
+  ]), TARGET);
   assert.equal(t.side, null);
   ok('other parties moving in the same transaction are not our trade');
 }
@@ -83,8 +83,8 @@ console.log('\nrobinhood classifier');
   ok('a self-transfer nets to zero');
 }
 {
-  // A reverted transaction still carries logs from before the revert in some
-  // traces; acting on them would be acting on something that did not happen.
+  // A reverted transaction still carries logs in some traces; acting on them
+  // would be acting on something that did not happen.
   const reverted = rcpt([xfer(TWINE, RELAYER, TARGET, 10n ** 18n)], '0x0');
   assert.equal(classifyRhTrade(reverted, TARGET).side, null);
   // A receipt with no status at all must not be assumed successful.
