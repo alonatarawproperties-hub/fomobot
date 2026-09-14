@@ -191,7 +191,14 @@ deliberately no flag in the other direction.
 
 ```sh
 npm run new-wallet      # prints an address and a key, writes nothing to disk
+node scripts/configure-executor.mjs 0xTheAddressItPrinted
 ```
+
+The second command writes only the executor block and leaves the rest of
+`config.json` alone. It refuses a 64-character private key pasted where the
+40-character address belongs — both start `0x`, the only visible difference is
+length, and without that guard the key lands in the one file this whole design
+exists to keep it out of.
 
 Use a **fresh** wallet, not one you already hold funds in. The key has to live on
 the server, so whatever is in that wallet is the most you can lose if the server
