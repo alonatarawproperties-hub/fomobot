@@ -184,6 +184,37 @@ which owns the connection to the aggregator, so a client-side keep-alive cannot
 reach the hop that costs. **A production box with a direct connection has not been
 measured.** Do not repeat the latency claim until it has.
 
+### What a launch actually does, measured
+
+2,150 pools were created on this chain in 19 hours. **253 had any trading at all
+in their first minute** — most launches are dead on arrival. Of the ones that
+traded, price movement was sampled from the `sqrtPriceX96` carried by every v4
+`Swap` event, so these are exact per-swap prices rather than candles.
+
+**Slippage.** Across 19,143 separate 1.2-second windows (the real quote→fill gap)
+in 205 launches, the median move inside one window is 1.29% — but the tail is
+long, p90 22.63% and p99 70.23%. The share of trades that would simply not fill:
+
+```
+   3% floor -> 41.4% miss        10% floor -> 24.1% miss
+   5% floor -> 34.7% miss        15% floor -> 17.1% miss
+   8% floor -> 27.5% miss        20% floor -> 11.9% miss
+```
+
+A miss costs nothing but the opportunity — the floor refuses, the money stays.
+
+Note the metric: an earlier version of this measured the WORST window in each
+launch and reported a 3% floor breaching 60% of launches. That overstates it,
+because a trade occupies one window rather than the worst one. Measure per
+window, not per launch.
+
+**And what happens to the position.** From an early entry, 30 seconds later the
+median launch is **-2.8%**, and only 40% are up at all; at 60 seconds 180 of 253
+are down. That is every launch on the chain, NOT specifically launches by an
+account with a following — which is the entire premise of this bot and is exactly
+what the recorded signals exist to test. It is not evidence the strategy fails.
+It is evidence that nothing here should be sized on hope.
+
 ### Catching a launch
 
 A launch is tradeable the instant its pool is created, but the aggregator has to
