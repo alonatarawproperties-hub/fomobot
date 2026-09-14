@@ -28,6 +28,7 @@ import { executeBuy, quoteUnitsForUsd, decideApproval, approvalAmounts, encodeAp
 import { KYBER } from './src/aggregator.mjs';
 import { makeExecutorDeps, loadPrivateKey, fetchReceipt, startWarmup, KEY_ENV } from './src/executor-io.mjs';
 import { USD_STABLES, ADDRESSES } from './src/chain/robinhood.mjs';
+import { startControl, loadControlState, saveControlState } from './src/control-io.mjs';
 
 const argv = process.argv.slice(2);
 const flag = (name, fallback = null) => {
@@ -151,7 +152,15 @@ const indexTraders = (raw) => {
 };
 indexTraders(config);
 
+const startedAt = Date.now();
 const policyState = initialState();
+
+// A pause given from a phone must outlive a reboot. Restored before the feed is
+// wired, so there is no window in which a paused bot takes a position because it
+// had not got round to reading the file yet.
+const CONTROL_PATH = `${(config.record?.dir ?? './data').replace(/\/$/, '')}/control.json`;
+const controlState = loadControlState(CONTROL_PATH);
+policyState.paused = controlState.paused;
 const copiedTxs = new Set(); // txHash dedupe: a replayed feed frame must not buy twice
 const execStats = { considered: 0, skipped: 0, refused: 0, bought: 0, papered: 0, errors: 0, queued: 0 };
 
@@ -546,6 +555,48 @@ if (executor.enabled && (executor.cfg.warmupMs ?? 15_000) > 0) {
   });
 }
 
+// --- telegram control plane --------------------------------------------------
+// The bot could talk but not listen, which meant the only kill switch was an SSH
+// session. Exactly one chat may command it — see control.mjs for why that check
+// is the whole point of the feature.
+let control = null;
+if (notifier.enabled && config.telegram?.botToken && config.telegram?.chatId) {
+  control = startControl({
+    botToken: config.telegram.botToken,
+    chatId: config.telegram.chatId,
+    log: (msg, extra) => log('warn', `control: ${msg}`, extra ?? {}),
+    snapshot: () => ({
+      paused: policyState.paused,
+      mode: executor.enabled ? (executor.paper ? 'paper' : 'live') : 'detect-only',
+      handles: [...new Set([...roster.list().map((e) => e.handle), ...solByAddress.values()])],
+      sizeUsd: executor.cfg?.sizeUsd ?? null,
+      maxOpenPositions: executor.cfg?.maxOpenPositions ?? 0,
+      slippageBps: executor.cfg?.slippageBps ?? 0,
+      uptimeMs: Date.now() - startedAt,
+      rh: feed?.stats ?? null,
+      solana: sol?.stats ?? 'disabled',
+      openMints: [...policyState.openMints],
+      ...execStats,
+    }),
+    onAction: (action) => {
+      if (action !== 'pause' && action !== 'resume') return;
+      policyState.paused = action === 'pause';
+      const saved = saveControlState(CONTROL_PATH, { paused: policyState.paused });
+      log('info', `control: ${action}`, { persisted: saved });
+      // A pause that did not persist would come back on as soon as the process
+      // restarted, which is exactly when nobody is watching. Say so rather than
+      // let it be discovered later.
+      if (!saved) notifier.send('\u26A0\uFE0F Could not save that to disk — it will NOT survive a restart.');
+    },
+  });
+
+  notifier.send(
+    `${policyState.paused ? '\u23F8 <b>Started PAUSED</b>' : '\u{1F7E2} <b>Started</b>'} — ` +
+    `${executor.enabled ? (executor.paper ? '\u{1F4C4} paper, nothing is spent' : '\u{1F4B8} LIVE') : 'watching only'}\n` +
+    'Send /help for commands.'
+  );
+}
+
 // --- pre-approval at startup -------------------------------------------------
 if (executor.enabled && !executor.paper && execDeps?.signer) {
   // Through the SAME queue entries use. The feed is already running by the time
@@ -574,6 +625,7 @@ const heartbeat = setInterval(() => {
     alertsDropped: notifier.dropped,
     executor: executor.enabled ? { mode: executor.paper ? 'paper' : 'live', ...execStats, open: policyState.openCount } : 'disabled',
     warmup: warmup ? { ...warmup.stats } : 'off',
+    control: control ? { paused: policyState.paused, ...control.stats } : 'off',
   });
 }, config.heartbeatMs ?? 60_000);
 
@@ -585,6 +637,7 @@ async function shutdown(signal) {
   log('info', 'shutting down', { signal, rh: feed?.stats, solana: sol?.stats });
   clearInterval(heartbeat);
   warmup?.stop();
+  control?.stop();
   feed?.stop();
   sol?.stop();
   await recorder.close();
