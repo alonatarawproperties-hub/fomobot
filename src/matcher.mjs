@@ -10,6 +10,18 @@
 // `via` records which one did, so the assumption stays checkable against live data
 // instead of being baked in.
 
+/**
+ * The name a roster entry is known by everywhere.
+ *
+ * Exported because index.mjs needs the same answer to look up sizing and
+ * cooldowns, and two copies of "handle, or the first few characters of the
+ * address" drift the moment one of them forgets to lowercase first. That
+ * particular drift is silent: the signal arrives under one spelling, the lookup
+ * misses under the other, and a trader plainly in the roster is skipped as
+ * `unknown-trader`.
+ */
+export const handleFor = (entry) => entry.handle ?? String(entry.address ?? '').toLowerCase().slice(0, 10);
+
 export class Roster {
   constructor(entries = []) {
     this.byAddress = new Map();
@@ -30,7 +42,7 @@ export class Roster {
       }
       if (e.enabled === false) continue;
       next.set(addr, {
-        handle: e.handle ?? addr.slice(0, 10),
+        handle: handleFor(e),
         address: addr,
         bare: addr.slice(2), // no 0x, for calldata scanning
         selfSends: e.selfSends === true,

@@ -1,32 +1,46 @@
 {
-  "_comment": "Copy to config.json and fill in solana.wsUrl / solana.httpUrl with a Helius key (free tier is enough), plus your Telegram bot token and chat id. Robinhood Chain needs no key.",
-
+  "_comment": "Copy to config.json and fill in solana.wsUrl / solana.httpUrl with a Helius key (free tier is enough), plus your Telegram bot token and chat id. Robinhood Chain needs no key. THE SIGNING KEY IS NEVER PUT IN THIS FILE - it is read from the FIRSTFILL_PRIVATE_KEY environment variable only, and a key found here is a startup failure.",
   "feedUrl": "wss://feed.mainnet.chain.robinhood.com",
   "explorerBase": "https://robinhoodchain.blockscout.com",
   "silenceMs": 15000,
   "heartbeatMs": 60000,
-
   "solana": {
     "wsUrl": "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
     "httpUrl": "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
     "commitment": "processed"
   },
-
   "roster": [
     {
       "handle": "ruralvalidsnake",
       "solana": "3owNGvPDRmgdTSBkp8ro2d5zBJCpnGi4nDhSkpgpqXeZ",
       "address": "0xb054643d9446d778511be5ed8f46d349b8ecc2c0",
       "enabled": true,
-      "notes": "EVM side is an EIP-7702 delegated ERC-4337 account (delegate 0xe6cae83bde06e4c305530e199d7217f42808555b); nonce 1, zero balance, so trades arrive via a bundler and match on calldata, never on sender. Volume is on Solana."
+      "notes": "EVM side is an EIP-7702 delegated ERC-4337 account (delegate 0xe6cae83bde06e4c305530e199d7217f42808555b); nonce 1, zero balance, so trades arrive via a bundler and match on calldata, never on sender. Volume was on Solana until 2026-09-14, when his first real Robinhood Chain buy landed (tx 0x853010bc..., +298,050.7 TWINE, worth about $848 at the time). sizeUsd is what WE spend copying him, in dollars - it has nothing to do with what he spent.",
+      "sizeUsd": 25
     }
   ],
-
   "telegram": {
     "enabled": true,
     "botToken": "PUT_BOT_TOKEN_HERE",
     "chatId": "PUT_CHAT_ID_HERE"
   },
-
-  "record": { "dir": "./data", "file": "signals.jsonl" }
+  "record": {
+    "dir": "./data",
+    "file": "signals.jsonl"
+  },
+  "executor": {
+    "_comment": "enabled:false means detect and alert only, exactly as before. paper:true runs every gate - quote, build, router pin, simulation, balance check - against live state and live prices, and signs nothing. PAPER STILL NEEDS THE WALLET FUNDED: the simulation reads real balances, so a dry run from an empty wallet refuses at insufficient-input-balance and proves nothing. --paper on the command line forces paper regardless of this file; there is no flag in the other direction.",
+    "enabled": false,
+    "paper": true,
+    "rpcUrl": "https://rpc.mainnet.chain.robinhood.com",
+    "wallet": "0xYOUR_WALLET_ADDRESS",
+    "quoteToken": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+    "sizeUsd": 25,
+    "slippageBps": 300,
+    "maxOutputDriftBps": 300,
+    "maxOpenPositions": 3,
+    "dailyLossLimitUsd": 100,
+    "cooldownMs": 60000,
+    "denylistTokens": []
+  }
 }

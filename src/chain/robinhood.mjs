@@ -32,6 +32,19 @@ export const ADDRESSES = {
   weth: '0x0bd7d308f8e1639fab988df18a8011f41eacad73',
 };
 
+// Quote tokens a USD trade size may be denominated in, with the decimals to
+// convert with. Confirmed on chain 2026-09-14 by calling symbol() and decimals()
+// on each rather than reading a token list: USDG -> "USDG"/6.
+//
+// It is an ALLOWLIST, and that is the point. `sizeUsd * 10**decimals` is only a
+// dollar amount if the token is worth a dollar; the same arithmetic against WETH
+// (also 18 decimals and also a quote token on this chain, per
+// robinhood-trade.mjs) would turn a $25 trade into 25 ETH. An unknown quote token
+// must therefore fail closed rather than be converted at an assumed price.
+export const USD_STABLES = new Map([
+  ['0x5fc5360d0400a0fd4f2af552add042d716f1d168', { symbol: 'USDG', decimals: 6 }],
+]);
+
 // Uniswap v3 fee tiers, in hundredths of a basis point.
 export const FEE_TIERS = [100, 500, 3000, 10000];
 

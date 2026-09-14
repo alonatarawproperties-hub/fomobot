@@ -27,8 +27,10 @@
 // What none of that covers is calldata encoding a DIFFERENT RECIPIENT. Pinning
 // the router stops us calling an attacker's contract; it does not stop the real
 // router sending the output somewhere else. The only real defence is to simulate
-// the swap and assert our own balance rises before broadcasting — that check
-// belongs to the executor and is deliberately not pretended at here.
+// the swap and assert our own balance rises before broadcasting. That check is
+// NOT here — it needs the chain, and this module is pure — it lives in
+// executor.mjs, which reads balanceOf either side of the swap inside one
+// eth_simulateV1 block and refuses to sign if our balance does not rise.
 
 export const KYBER = {
   base: 'https://aggregator-api.kyberswap.com',
@@ -53,10 +55,20 @@ const big = (v) => { try { return BigInt(v); } catch { return null; } };
  * Guard a build response before anything is signed. Pure.
  *
  * On success returns `expectedOut` — what the build says we will receive. That
- * is NOT a slippage floor and must never be used as one: the on-chain minimum
- * comes from minOutFor() and nowhere else. Naming it `minOut` once already
- * invited exactly that mistake, whose failure mode is a bad fill rather than an
- * error, so nothing would surface it.
+ * is NOT a slippage floor and must never be used as one. Naming it `minOut` once
+ * already invited exactly that mistake, whose failure mode is a bad fill rather
+ * than an error, so nothing would surface it.
+ *
+ * This used to go on to say the on-chain minimum "comes from minOutFor() and
+ * nowhere else", which is wrong in a way worth correcting rather than deleting.
+ * MEASURED 2026-09-14 against real builds of the same route: the floor is
+ * encoded by Kyber inside the calldata, in word 211 of the swap arguments —
+ * 3567555826670237273239 at slippageTolerance=1 and 1783956308966015238143 at
+ * 5000, each `routeSummary.amountOut * (1 - slip)` less one unit of rounding. So
+ * the on-chain floor comes from the `slippageBps` handed to buildSwap, and
+ * minOutFor() is OUR independent floor, checked against a simulated balance
+ * delta before signing. Two different floors doing two different jobs; believing
+ * there was one is how a reader ends up trusting whichever they thought of.
  *
  * @param {object} build  the `data` object from /route/build
  * @param {object} quote  the routeSummary the build was derived from
@@ -103,9 +115,12 @@ export function verifyBuild(build, quote, limits = {}) {
 }
 
 /**
- * Worst acceptable output for a given slippage — the on-chain floor.
+ * Worst acceptable output for a given slippage — OUR floor, not the chain's.
+ *
  * Computed here rather than trusted from the response: the whole point of a
- * minimum is that WE choose it.
+ * minimum is that WE choose it. The executor feeds this the QUOTE's amountOut
+ * and never the build's, so a degraded or hostile build cannot lower the bar it
+ * is about to be measured against.
  */
 export function minOutFor(amountOut, slippageBps) {
   const out = big(amountOut);
