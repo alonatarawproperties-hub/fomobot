@@ -267,4 +267,29 @@ const txOf = (pre, post) => ({ meta: { preTokenBalances: pre, postTokenBalances:
   ok('a transaction with no balance data yields nothing rather than throwing');
 }
 
+console.log('\nfeed stall alarm (read as source)');
+
+{
+  // The stall handler closes the socket, so the reconnect's `open` used to clear
+  // `stalled` before any frame arrived -- which made the recovered path in
+  // #onMessage unreachable and left the alert firing with no all-clear. Two
+  // places resetting one flag, and the one that ran first silently disabled the
+  // other. Verified by putting the assignment back into the open handler.
+  const { readFileSync } = await import('node:fs');
+  const FEED = readFileSync(new URL('./src/feed.mjs', import.meta.url), 'utf8')
+    .replace(/(^|[^:])\/\/[^\n]*/g, '$1')
+    .replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.ok(FEED.length > 500, 'feed.mjs stripped to nothing');
+
+  // The constructor's initialisation is fine; what must never come back is a
+  // clear inside the CONNECT handler, which is what shadowed the real one.
+  const openAt = FEED.indexOf("addEventListener('open'");
+  const messageAt = FEED.indexOf("addEventListener('message'");
+  assert.ok(openAt > 0 && messageAt > openAt, 'the open and message handlers moved');
+  assert.ok(!/this\.stalled\s*=\s*false/.test(FEED.slice(openAt, messageAt)),
+    'the open handler must not clear the stall flag — a connected socket is not a receiving one');
+  assert.match(FEED, /this\.stalled\s*=\s*false;\s*this\.emit\('recovered'/);
+  ok('a stall clears only when frames actually resume, and says so');
+}
+
 console.log(`\n${pass} passed\n`);

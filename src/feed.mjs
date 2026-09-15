@@ -61,7 +61,14 @@ export class SequencerFeed extends EventEmitter {
     ws.addEventListener('open', () => {
       this.attempt = 0;
       this.lastFrameAt = Date.now();
-      this.stalled = false;
+      // `stalled` is deliberately NOT cleared here. A stall closes the socket, so
+      // the reconnect's `open` fired before any frame arrived and reset the flag
+      // that #onMessage checks — which made emit('recovered') unreachable after a
+      // stall, so the alert fired and never said all-clear. An alarm that only
+      // ever goes off is one nobody reads.
+      //
+      // It is also the more honest invariant: an open socket is not a receiving
+      // one, and the thing being watched is whether frames are arriving.
       this.emit('open', { connectMs: Date.now() - openedAt });
       this.#armStallCheck();
     });

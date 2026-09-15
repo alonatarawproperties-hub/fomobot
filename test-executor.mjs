@@ -11,7 +11,7 @@ import { id } from 'ethers';
 import {
   SELECTOR, REFUSE_SEND, encodeApprove, encodeBalanceOf, encodeAllowance, decodeUint,
   decodeQuantity, decideApproval, approvalAmounts, buildSimulationCalls, readSimulation,
-  verifySimulation, gasWithBuffer, quoteUnitsForUsd, decimalString, quoteWithRetry, executeBuy,
+  verifySimulation, gasWithBuffer, quoteUnitsForUsd, decimalString, quoteWithRetry, formatUnits, executeBuy,
 } from './src/executor.mjs';
 import { USD_STABLES } from './src/chain/robinhood.mjs';
 import { KYBER } from './src/aggregator.mjs';
@@ -148,6 +148,29 @@ console.log('\ndollar sizing');
   assert.equal(quoteUnitsForUsd('25', USDG), null);
   assert.equal(quoteUnitsForUsd(1e13, USDG), null); // beyond where toFixed stays decimal
   ok('a size is truncated down, and anything that lands on zero refuses');
+}
+
+{
+  // The number an operator actually reads. His real $430 buy reported
+  // "6,668,726,392,704,294,000,000,000 units" -- correct, unreadable, and
+  // reported back as "what does this mean".
+  assert.equal(formatUnits('6668726392704294000000000', 18), '6,668,726.39');
+  assert.equal(formatUnits(430_000_000n, 6), '430');
+  assert.equal(formatUnits('5000000000000000000', 18), '5');
+  assert.equal(formatUnits(0n, 18), '0');
+  ok('a raw chain amount prints as the number a person means');
+}
+{
+  // Never defaulted to 18. A wrong guess is off by orders of magnitude and looks
+  // exactly as confident as a right one, so the caller is told we do not know.
+  assert.equal(formatUnits('123', null), null);
+  assert.equal(formatUnits('123', undefined), null);
+  assert.equal(formatUnits('123', 1.5), null);
+  assert.equal(formatUnits('123', -1), null);
+  assert.equal(formatUnits('123', 99), null);
+  assert.equal(formatUnits('not a number', 18), null);
+  assert.equal(formatUnits(null, 18), null);
+  ok('unknown or implausible decimals return null rather than a confident wrong number');
 }
 
 console.log('\napproval policy');

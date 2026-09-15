@@ -83,6 +83,7 @@ export const SELECTOR = {
   approve: '0x095ea7b3',
   balanceOf: '0x70a08231',
   allowance: '0xdd62ed3e',
+  decimals: '0x313ce567',
 };
 
 // Kyber's stand-in for the chain's native currency, in both spellings it uses.
@@ -114,6 +115,37 @@ export function encodeApprove(spender, amount) {
     throw new Error(`approve: ${amount} is not a uint256`);
   }
   return SELECTOR.approve + addressWord(spender) + word(amount);
+}
+
+/**
+ * A raw on-chain amount as a human number.
+ *
+ * Every token amount here is an integer of the token's smallest unit, and an
+ * 18-decimal token makes that integer around a million times larger than the
+ * number anyone means. Printed raw, a $430 buy reported "6,668,726,392,704,294,
+ * 000,000,000 units" — technically correct, completely unreadable, and reported
+ * by the operator as "what does this mean".
+ *
+ * `decimals` must be the token's own. It is NOT defaulted to 18: a guess that is
+ * wrong prints a number off by orders of magnitude and looks just as confident as
+ * a right one, so an unknown value returns null and the caller says so.
+ */
+export function formatUnits(raw, decimals) {
+  let value;
+  try { value = BigInt(raw); } catch { return null; }
+  if (typeof decimals !== 'number' || !Number.isInteger(decimals) || decimals < 0 || decimals > 36) return null;
+
+  const base = 10n ** BigInt(decimals);
+  const whole = value / base;
+  const frac = value % base;
+  if (frac === 0n) return whole.toLocaleString('en-US');
+  const fracStr = frac.toString().padStart(decimals, '0').slice(0, 2).replace(/0+$/, '');
+  return fracStr ? `${whole.toLocaleString('en-US')}.${fracStr}` : whole.toLocaleString('en-US');
+}
+
+/** decimals(). */
+export function encodeDecimals() {
+  return SELECTOR.decimals;
 }
 
 /** balanceOf(owner). */

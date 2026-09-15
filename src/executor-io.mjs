@@ -13,7 +13,7 @@
 
 import { JsonRpcProvider, Wallet } from 'ethers';
 import { KYBER, quoteSwap, buildSwap } from './aggregator.mjs';
-import { encodeAllowance, encodeBalanceOf, decodeUint } from './executor.mjs';
+import { encodeAllowance, encodeBalanceOf, encodeDecimals, decodeUint } from './executor.mjs';
 
 export const KEY_ENV = 'FIRSTFILL_PRIVATE_KEY';
 
@@ -163,6 +163,11 @@ export function makeExecutorDeps({
 
   const signer = privateKey ? new Wallet(privateKey, provider) : null;
 
+  // A token's decimals never change, so this is read once per token. Off the hot
+  // path entirely: it is only used to make an alert readable, never to decide
+  // anything, so a failure degrades the message rather than the trade.
+  const decimalsCache = new Map();
+
   const readUint = async (to, data) => {
     const value = decodeUint(await provider.call({ to, data }));
     // An unreadable read is null all the way up. The executor treats null as a
@@ -193,6 +198,15 @@ export function makeExecutorDeps({
     ),
 
     getTokenBalance: ({ token, owner }) => readUint(token, encodeBalanceOf(owner)),
+
+    async getTokenDecimals(token) {
+      const key = String(token).toLowerCase();
+      if (decimalsCache.has(key)) return decimalsCache.get(key);
+      const raw = await readUint(token, encodeDecimals()).catch(() => null);
+      const dp = raw === null || raw > 36n ? null : Number(raw);
+      decimalsCache.set(key, dp);
+      return dp;
+    },
     getAllowance: ({ token, owner, spender }) => readUint(token, encodeAllowance(owner, spender)),
     getNativeBalance: (owner) => provider.getBalance(owner),
 

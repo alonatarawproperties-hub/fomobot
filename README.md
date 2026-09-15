@@ -391,7 +391,7 @@ Needs Node 22+ (for the built-in WebSocket).
 ```sh
 npm install
 cp config.example.json config.json   # fill in Helius, Telegram, and the executor block
-npm test                             # 166 offline assertions, no network
+npm test                             # 169 offline assertions, no network
 npm run paper                        # detect + decide + simulate, sign nothing
 npm start
 ```

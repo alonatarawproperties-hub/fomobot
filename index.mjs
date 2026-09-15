@@ -24,7 +24,7 @@ import { Recorder } from './src/record.mjs';
 import { SolanaWatcher, classifyTrade } from './src/solana.mjs';
 import { classifyRhTrade, isRhTrade } from './src/robinhood-trade.mjs';
 import { decideEntry, initialState } from './src/policy.mjs';
-import { executeBuy, quoteUnitsForUsd, decideApproval, approvalAmounts, encodeApprove } from './src/executor.mjs';
+import { executeBuy, quoteUnitsForUsd, decideApproval, approvalAmounts, encodeApprove, formatUnits } from './src/executor.mjs';
 import { KYBER } from './src/aggregator.mjs';
 import { makeExecutorDeps, loadPrivateKey, fetchReceipt, startWarmup, KEY_ENV } from './src/executor-io.mjs';
 import { USD_STABLES, ADDRESSES } from './src/chain/robinhood.mjs';
@@ -374,13 +374,19 @@ async function copyBuy(sig, trade) {
   policyState.openMints.add(trade.token);
   policyState.lastEntryAt.set(sig.handle, Date.now());
 
-  const out = Number(result.plan.simulatedOut);
+  // Read the token's own decimals so the alert says what the operator means.
+  // Deliberately after the trade decision and fail-soft: this only formats a
+  // message, so an unreadable token costs a readable number, never a trade.
+  const dp = await execDeps.getTokenDecimals(trade.token).catch(() => null);
+  const pretty = formatUnits(result.plan.simulatedOut, dp);
+  const amount = pretty ? `${pretty} tokens` : `${result.plan.simulatedOut} (raw units — could not read this token's decimals)`;
+
   if (result.sent) {
     execStats.bought++;
     notifier.send(
       `\u2705 <b>COPIED ${esc(sig.handle)}</b> $${decision.sizeUsd}\n` +
       `<code>${esc(trade.token)}</code>\n` +
-      `got ~${out.toLocaleString('en-US', { maximumFractionDigits: 0 })} units\n` +
+      `got ~${amount}\n` +
       `${(config.explorerBase ?? '').replace(/\/$/, '')}/tx/${result.hash}`
     );
   } else {
@@ -388,7 +394,7 @@ async function copyBuy(sig, trade) {
     notifier.send(
       `\u{1F4C4} <b>PAPER</b> would have copied ${esc(sig.handle)} for $${decision.sizeUsd}\n` +
       `<code>${esc(trade.token)}</code>\n` +
-      `simulated ~${out.toLocaleString('en-US', { maximumFractionDigits: 0 })} units, nothing signed`
+      `simulated ~${amount}, nothing signed`
     );
   }
 }
