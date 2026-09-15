@@ -15,6 +15,8 @@
 // bot exists and is live to anyone probing usernames; silence tells them nothing
 // and costs us nothing, since the operator is never in that branch.
 
+import { parseAddTrader, applyAdd, applyRemove, formatRoster } from './roster-edit.mjs';
+
 export const REPLY = {
   UNKNOWN: 'unknown-command',
   NOT_A_COMMAND: 'not-a-command',
@@ -93,6 +95,52 @@ const pad = (n, w = 0) => String(n).padStart(w);
  */
 export function decideCommand(parsed, snap) {
   switch (parsed.cmd) {
+    case 'traders':
+      return { action: 'none', reply: formatRoster(snap.roster) };
+
+    case 'add': {
+      const parsed2 = parseAddTrader(parsed.args);
+      if (!parsed2.ok) return { action: 'none', reply: `\u26A0\uFE0F ${parsed2.error}` };
+      const { added } = applyAdd(snap.roster ?? [], parsed2.entry);
+      const chains = [parsed2.entry.solana ? 'Solana' : null, parsed2.entry.address ? 'Robinhood Chain' : null].filter(Boolean).join(' + ');
+      return {
+        action: 'add-trader',
+        payload: parsed2.entry,
+        reply: `\u2705 <b>${added ? 'Watching' : 'Updated'} ${parsed2.entry.handle}</b> on ${chains}\n\n`
+          // Said every time, because a copied trader is a trade the operator did
+          // not individually approve, and the size is the one number that decides
+          // how much that costs.
+          + `Trades will be copied at $${snap.sizeUsd} like everyone else on the list.`,
+      };
+    }
+
+    case 'remove': {
+      const handle = parsed.args?.[0];
+      if (!handle) return { action: 'none', reply: 'Usage: /remove &lt;handle&gt;' };
+      const res = applyRemove(snap.roster ?? [], handle);
+      if (!res.found) return { action: 'none', reply: `\u26A0\uFE0F Nobody called <b>${handle}</b> is on the list. /traders to see it.` };
+      if (res.alreadyOff) return { action: 'none', reply: `<b>${res.entry.handle}</b> is already off.` };
+
+      // Removing the last one would write a config the bot refuses to LOAD --
+      // it requires at least one watched address -- so the next restart would
+      // fail to come up at all, discovered whenever that restart happened to be.
+      // Pausing is what this person actually wants.
+      const stillOn = (snap.roster ?? []).filter((e) => e.enabled !== false && !sameHandleFor(e.handle, handle));
+      if (!stillOn.length) {
+        return {
+          action: 'none',
+          reply: `\u26A0\uFE0F <b>${res.entry.handle}</b> is the only trader left, and the bot will not start with an empty list.\n\nUse /pause to stop trading instead.`,
+        };
+      }
+      return {
+        action: 'remove-trader',
+        payload: res.entry.handle,
+        // Disabled, not deleted -- and the operator is told, so they do not
+        // re-research addresses they still have.
+        reply: `\u{1F6D1} <b>${res.entry.handle}</b> is off. Their details are kept — /add the same handle to switch them back on.`,
+      };
+    }
+
     case 'start':
     case 'help':
       return { action: 'none', reply: helpText() };
@@ -122,6 +170,8 @@ export function decideCommand(parsed, snap) {
   }
 }
 
+const sameHandleFor = (a, b) => String(a ?? '').toLowerCase() === String(b ?? '').toLowerCase();
+
 function helpText() {
   return [
     '<b>Commands</b>',
@@ -130,6 +180,10 @@ function helpText() {
     '/pause     — stop opening new positions',
     '/resume    — start again',
     '/positions — what it currently holds',
+    '',
+    '/traders   — who is being copied',
+    '/add       — /add handle &lt;address&gt; [&lt;address&gt;]',
+    '/remove    — /remove handle',
     '/help      — this',
   ].join('\n');
 }

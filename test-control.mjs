@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseCommand, isAuthorized, decideCommand, isStale } from './src/control.mjs';
 import { loadControlState, saveControlState } from './src/control-io.mjs';
+import { classifyAddress, parseAddTrader, applyAdd, applyRemove, formatRoster } from './src/roster-edit.mjs';
 
 let pass = 0;
 const ok = (name) => { console.log(`  ok  ${name}`); pass++; };
@@ -81,7 +82,108 @@ console.log('\nauthorisation');
   ok('two ids that collide as numbers are still told apart');
 }
 
+console.log('\nthe watch list');
+
+const SOL = '3owNGvPDRmgdTSBkp8ro2d5zBJCpnGi4nDhSkpgpqXeZ';
+const EVM = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+const ROSTER = [
+  { handle: 'ruralvalidsnake', solana: SOL, address: EVM, enabled: true, sizeUsd: 430, notes: 'hard-won research' },
+  { handle: 'someoneelse', address: '0x' + 'aa'.repeat(20), enabled: true },
+];
+
+{
+  assert.deepEqual(classifyAddress(EVM), { chain: 'evm', address: EVM });
+  assert.deepEqual(classifyAddress(SOL), { chain: 'solana', address: SOL });
+  // Capitalisation IS the checksum on an EVM address, so a mistyped one is
+  // caught here. The correctly checksummed form normalises to lowercase.
+  assert.equal(classifyAddress('0xB054643d9446D778511bE5eD8f46D349b8ECc2c0').address, EVM);
+  assert.equal(classifyAddress('0xB054643d9446D778511bE5eD8f46D349b8ECc2c1'), null);
+  ok('an address is decoded and matched to its chain, and a bad EVM checksum is refused');
+}
+{
+  // A Solana address is 32 bytes exactly. A loose size bound accepted this one
+  // with a character deleted, which is the typo the whole check exists for.
+  assert.equal(classifyAddress(SOL.slice(0, -1)), null, 'one character short');
+  assert.equal(classifyAddress(SOL + 'a'), null, 'one character long');
+  assert.equal(classifyAddress('11111111111111111111111111111111')?.chain, 'solana', 'leading zero bytes are 1s');
+  assert.equal(classifyAddress('So11111111111111111111111111111111111111112')?.chain, 'solana');
+  ok('a Solana address must decode to exactly 32 bytes, leading zeroes included');
+}
+{
+  // Stated rather than hidden: that format has no checksum, so a typo landing on
+  // 32 valid bytes cannot be told from a real address here. index.mjs asks the
+  // chain whether it has ever been used, which is what catches this.
+  assert.equal(classifyAddress(SOL.slice(1))?.chain, 'solana');
+  ok('a same-length Solana typo is NOT catchable by shape - a known limit, not a gap');
+}
+{
+  assert.equal(classifyAddress('hello'), null);
+  assert.equal(classifyAddress('0x1234'), null);
+  assert.equal(classifyAddress(''), null);
+  assert.equal(classifyAddress(null), null);
+  ok('nonsense is refused rather than written to the watch list');
+}
+{
+  const r = parseAddTrader(['newguy', SOL, EVM]);
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.entry, { handle: 'newguy', enabled: true, solana: SOL, address: EVM });
+  assert.equal(parseAddTrader(['solonly', SOL]).entry.address, undefined);
+  ok('a trader can be added with one chain or both');
+}
+{
+  for (const [args, why] of [
+    [[], 'nothing'],
+    [['justahandle'], 'no address'],
+    [['bad handle!', SOL], 'unusable handle'],
+    [['x', 'notanaddress'], 'bad address'],
+    [['x', EVM, EVM], 'two EVM addresses'],
+    [['x', SOL, SOL], 'two Solana addresses'],
+  ]) {
+    const r = parseAddTrader(args);
+    assert.equal(r.ok, false, why);
+    assert.ok(r.error.length > 10, `${why} should explain itself`);
+  }
+  ok('every refusal says what was wrong with it');
+}
+{
+  const { roster, added } = applyAdd(ROSTER, { handle: 'thirdguy', address: '0x' + 'bb'.repeat(20), enabled: true });
+  assert.equal(added, true);
+  assert.equal(roster.length, 3);
+  assert.equal(ROSTER.length, 2, 'the original list is not mutated');
+  ok('a new trader is appended without disturbing the rest');
+}
+{
+  // Re-adding to fix one address must not silently drop a size or notes that
+  // took real work to establish.
+  const { roster, added } = applyAdd(ROSTER, { handle: 'RuralValidSnake', solana: SOL, enabled: true });
+  assert.equal(added, false, 'matched case-insensitively');
+  assert.equal(roster.length, 2);
+  assert.equal(roster[0].sizeUsd, 430);
+  assert.equal(roster[0].notes, 'hard-won research');
+  assert.equal(roster[0].address, EVM, 'the untouched chain survives');
+  ok('re-adding a trader merges, keeping size, notes and the other chain');
+}
+{
+  const r = applyRemove(ROSTER, 'someoneelse');
+  assert.equal(r.found, true);
+  assert.equal(r.roster.length, 2, 'disabled, not deleted');
+  assert.equal(r.roster[1].enabled, false);
+  assert.equal(r.roster[1].address, '0x' + 'aa'.repeat(20), 'the address is kept for /add to restore');
+  assert.equal(applyRemove(ROSTER, 'nobody').found, false);
+  assert.equal(applyRemove(r.roster, 'someoneelse').alreadyOff, true);
+  ok('removing disables and keeps the details, so it can be undone from a phone');
+}
+{
+  assert.match(formatRoster([]), /Nobody is being watched/);
+  const text = formatRoster(ROSTER);
+  assert.ok(text.includes('ruralvalidsnake') && text.includes('$430'));
+  assert.ok(text.includes('SOL 3owNGv') && text.includes('RH 0xb054'));
+  assert.match(formatRoster([{ handle: 'gone', address: EVM, enabled: false }]), /Off \(1\)/);
+  ok('the list shows who is on, who is off, and which chains each is watched on');
+}
+
 console.log('\nstale messages');
+
 
 const START = 1_700_000_000_000; // ms
 const at = (ms) => ({ date: Math.floor(ms / 1000) });
@@ -169,7 +271,39 @@ console.log('\ndecisions');
   ok('only pause and resume change anything; nothing here can move money');
 }
 
+{
+  const withRoster = (over = {}) => snap({ roster: ROSTER, ...over });
+  assert.match(decideCommand({ cmd: 'traders', args: [] }, withRoster()).reply, /ruralvalidsnake/);
+
+  const add = decideCommand({ cmd: 'add', args: ['newguy', SOL] }, withRoster());
+  assert.equal(add.action, 'add-trader');
+  assert.equal(add.payload.handle, 'newguy');
+  assert.match(add.reply, /\$430/, 'says what it will cost per copy');
+
+  assert.equal(decideCommand({ cmd: 'add', args: ['x', 'rubbish'] }, withRoster()).action, 'none');
+  assert.equal(decideCommand({ cmd: 'add', args: [] }, withRoster()).action, 'none');
+  ok('traders can be listed and added, and a bad address changes nothing');
+}
+{
+  const r = decideCommand({ cmd: 'remove', args: ['someoneelse'] }, snap({ roster: ROSTER }));
+  assert.equal(r.action, 'remove-trader');
+  assert.equal(r.payload, 'someoneelse');
+  assert.equal(decideCommand({ cmd: 'remove', args: ['nobody'] }, snap({ roster: ROSTER })).action, 'none');
+  ok('removing a trader names them, and an unknown handle does nothing');
+}
+{
+  // Removing the last one writes a config the bot REFUSES to load, so the next
+  // restart would not come up at all - discovered whenever that happened to be.
+  const solo = [{ handle: 'onlyone', address: EVM, enabled: true }];
+  const r = decideCommand({ cmd: 'remove', args: ['onlyone'] }, snap({ roster: solo }));
+  assert.equal(r.action, 'none');
+  assert.match(r.reply, /only trader left/);
+  assert.match(r.reply, /\/pause/, 'points at what they actually want');
+  ok('the last trader cannot be removed, because the bot would not restart');
+}
+
 console.log('\npersistence');
+
 
 const dir = mkdtempSync(join(tmpdir(), 'ff-control-'));
 const path = join(dir, 'control.json');
@@ -236,6 +370,16 @@ assert.ok(INDEX.length > 2000, 'index.mjs stripped to nothing');
   assert.ok(!/const firstPoll/.test(CIO), 'the poll-count heuristic must not come back');
   assert.match(CIO, /isStale\(message, startedAt\)/);
   ok('the backlog is judged by timestamp, and the offset always advances');
+}
+{
+  // A direct write that dies half way leaves a truncated config.json, and the
+  // next restart then cannot parse the only file that says who to watch and how
+  // much to spend. Rename is atomic; a plain write is not.
+  assert.match(INDEX, /renameSync\(tmp, path\)/, 'the config must be written via a temp file and renamed');
+  const write = INDEX.indexOf('writeFileSync(tmp');
+  const rename = INDEX.indexOf('renameSync(tmp');
+  assert.ok(write > 0 && rename > write, 'written to the temp file, then renamed over the real one');
+  ok('the watch list is saved atomically, so a crash cannot truncate it');
 }
 {
   const saves = [...INDEX.matchAll(/saveControlState\s*\(/g)];

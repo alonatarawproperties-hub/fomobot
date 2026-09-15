@@ -50,6 +50,50 @@ export class SolanaWatcher extends EventEmitter {
 
   start() { this.stopped = false; this.#connect(); }
 
+  /**
+   * Watch another wallet without restarting.
+   *
+   * `logsSubscribe` is the same message the open handler sends, so a wallet added
+   * now is watched exactly as one configured at boot. Without this, adding a
+   * trader from a phone would leave their Solana side silently unwatched until
+   * somebody happened to restart the process — and nothing would say so.
+   */
+  addAddress(address) {
+    if (!address || this.addresses.includes(address)) return false;
+    this.addresses.push(address);
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      const id = this.nextId++;
+      this.subs.set(id, address);
+      this.ws.send(JSON.stringify({
+        jsonrpc: '2.0', id, method: 'logsSubscribe',
+        params: [{ mentions: [address] }, { commitment: this.commitment }],
+      }));
+    }
+    // Not yet connected is fine: #connect subscribes the whole list on open.
+    return true;
+  }
+
+  /** Stop watching a wallet. */
+  removeAddress(address) {
+    const at = this.addresses.indexOf(address);
+    if (at < 0) return false;
+    this.addresses.splice(at, 1);
+
+    for (const [subId, addr] of this.subToAddress) {
+      if (addr !== address) continue;
+      this.subToAddress.delete(subId);
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        try {
+          this.ws.send(JSON.stringify({ jsonrpc: '2.0', id: this.nextId++, method: 'logsUnsubscribe', params: [subId] }));
+        } catch { /* the socket is going anyway; the next connect uses the new list */ }
+      }
+    }
+    // A confirmation still in flight would otherwise resubscribe this address the
+    // moment it lands.
+    for (const [rpcId, addr] of this.subs) if (addr === address) this.subs.delete(rpcId);
+    return true;
+  }
+
   stop() {
     this.stopped = true;
     clearInterval(this.pingTimer);

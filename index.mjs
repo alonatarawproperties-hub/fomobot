@@ -16,7 +16,7 @@
 // poll. A config that fails to parse is rejected and the previous roster keeps
 // running, so a typo cannot blind the watcher.
 
-import { readFileSync, watchFile } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, watchFile } from 'node:fs';
 import { SequencerFeed } from './src/feed.mjs';
 import { Roster, toSignal, handleFor } from './src/matcher.mjs';
 import { Notifier, formatSignal } from './src/notify.mjs';
@@ -29,6 +29,7 @@ import { KYBER } from './src/aggregator.mjs';
 import { makeExecutorDeps, loadPrivateKey, fetchReceipt, startWarmup, KEY_ENV } from './src/executor-io.mjs';
 import { USD_STABLES, ADDRESSES } from './src/chain/robinhood.mjs';
 import { startControl, loadControlState, saveControlState } from './src/control-io.mjs';
+import { applyAdd, applyRemove } from './src/roster-edit.mjs';
 
 const argv = process.argv.slice(2);
 const flag = (name, fallback = null) => {
@@ -561,6 +562,98 @@ if (executor.enabled && (executor.cfg.warmupMs ?? 15_000) > 0) {
   });
 }
 
+/**
+ * Persist the config.
+ *
+ * Written to a temporary file and renamed, because rename is atomic: a crash or
+ * a full disk half way through a direct write leaves a truncated config.json,
+ * and the next restart then fails to parse the only file that says who to watch
+ * and how much to spend.
+ */
+function saveConfig(path, next) {
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
+  renameSync(tmp, path);
+}
+
+/**
+ * Apply a roster change to the running bot AND to disk.
+ *
+ * Applied in memory first rather than waiting for the config watcher to notice
+ * the file: the watcher polls, so a reply saying "watching now" would otherwise
+ * be true only a couple of seconds later. Re-applying the same change when the
+ * watcher does fire is harmless.
+ */
+function applyRosterChange(nextRoster) {
+  config.roster = nextRoster;
+  saveConfig(CONFIG_PATH, config);
+
+  roster.replace(nextRoster.filter((e) => e.address));
+  feed?.setPrefilter(roster.size > 0 && !roster.anySelfSends ? roster.needles() : null);
+  indexTraders(config);
+
+  // Solana subscriptions are added and dropped on the live socket, so a trader
+  // added from a phone is watched on both chains immediately rather than on
+  // whenever somebody next restarts the process.
+  if (sol) {
+    const wanted = new Set(nextRoster.filter((e) => e.enabled !== false && e.solana).map((e) => e.solana));
+    for (const addr of wanted) {
+      if (!solByAddress.has(addr)) {
+        const handle = nextRoster.find((e) => e.solana === addr)?.handle ?? addr.slice(0, 6);
+        solByAddress.set(addr, handle);
+        sol.addAddress(addr);
+      }
+    }
+    for (const addr of [...solByAddress.keys()]) {
+      if (!wanted.has(addr)) { solByAddress.delete(addr); sol.removeAddress(addr); }
+    }
+  }
+}
+
+/**
+ * Has this trader's address ever been used? Reported, never enforced.
+ *
+ * Fail-soft in both directions: an RPC that cannot answer says nothing rather
+ * than casting doubt on a good address, and a silent address is flagged rather
+ * than refused, because a real trader with a fresh wallet is possible and the
+ * operator is the one who knows.
+ */
+async function reportTraderActivity(entry) {
+  const notes = [];
+  try {
+    if (entry.solana && config.solana?.httpUrl) {
+      const res = await fetch(config.solana.httpUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getSignaturesForAddress', params: [entry.solana, { limit: 1 }] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const body = await res.json();
+      if (Array.isArray(body?.result)) {
+        notes.push(body.result.length
+          ? '\u2705 Solana address has on-chain history'
+          : '\u26A0\uFE0F Solana address has NO history — check for a typo, that format has no checksum');
+      }
+    }
+    if (entry.address && executor.cfg?.rpcUrl) {
+      const res = await fetch(executor.cfg.rpcUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getTransactionCount', params: [entry.address, 'latest'] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const body = await res.json();
+      if (typeof body?.result === 'string') {
+        // Nonce 0 is NORMAL for a fomo trader — their trades are sent by a
+        // bundler, so their own account may never have sent anything. Reported
+        // as information, not as a warning.
+        notes.push(`Robinhood Chain account has sent ${Number(BigInt(body.result))} transaction(s)`);
+      }
+    }
+  } catch { /* a check that cannot run says nothing */ }
+  if (notes.length) notifier.send(`<b>${esc(entry.handle)}</b>\n${notes.join('\n')}`);
+}
+
 // --- telegram control plane --------------------------------------------------
 // The bot could talk but not listen, which meant the only kill switch was an SSH
 // session. Exactly one chat may command it — see control.mjs for why that check
@@ -582,9 +675,28 @@ if (notifier.enabled && config.telegram?.botToken && config.telegram?.chatId) {
       rh: feed?.stats ?? null,
       solana: sol?.stats ?? 'disabled',
       openMints: [...policyState.openMints],
+      roster: config.roster,
       ...execStats,
     }),
-    onAction: (action) => {
+    onAction: (action, payload) => {
+      if (action === 'add-trader' || action === 'remove-trader') {
+        try {
+          const next = action === 'add-trader'
+            ? applyAdd(config.roster, payload).roster
+            : applyRemove(config.roster, payload).roster;
+          applyRosterChange(next);
+          log('info', `control: ${action}`, { handle: payload?.handle ?? payload, watching: roster.size });
+          // Shape checks cannot catch a Solana typo — that format has no
+          // checksum, so any 32 bytes is "valid". Asking the chain whether the
+          // address has ever been used is what actually catches one, and getting
+          // it wrong silently means watching a wallet nobody owns.
+          if (action === 'add-trader') void reportTraderActivity(payload);
+        } catch (err) {
+          log('error', `control: ${action} failed`, { error: err?.message ?? String(err) });
+          notifier.send(`\u26A0\uFE0F Could not save that change — the watch list is unchanged.\n${esc(err?.message ?? '')}`);
+        }
+        return;
+      }
       if (action !== 'pause' && action !== 'resume') return;
       policyState.paused = action === 'pause';
       const saved = saveControlState(CONTROL_PATH, { paused: policyState.paused });

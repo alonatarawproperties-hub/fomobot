@@ -350,8 +350,39 @@ signature.
 /pause       stop opening new positions
 /resume      start again
 /positions   what it currently holds
+
+/traders     who is being copied
+/add         /add <handle> <address> [<address>]
+/remove      /remove <handle>
 /help
 ```
+
+**Editing the watch list from a phone.** `/add` takes a handle and one or two
+addresses; the chain is worked out by decoding each one, not by pattern-matching
+its length. Both chains take effect immediately — the EVM roster hot-reloads, and
+Solana subscriptions are added to and dropped from the LIVE socket, so an added
+trader is watched on both chains without a restart.
+
+`/remove` **disables rather than deletes**: the entry holds addresses that were
+researched and notes explaining things like a 4337 account matching on calldata,
+and throwing that away because somebody typed `/remove` on a phone is not
+recoverable from the phone. `/add` of the same handle switches them back on, and
+re-adding MERGES, so correcting one address does not wipe a size or notes.
+
+**The last trader cannot be removed.** `loadConfig` requires at least one watched
+address, so removing the only one would write a config the bot refuses to load —
+and the failure would surface at whatever unrelated moment it next restarted.
+The reply points at `/pause`, which is what that person wants.
+
+**What validation can and cannot catch.** An EVM address carries a checksum in
+its capitalisation, so a mistyped one is refused. A Solana address carries none:
+any 32 bytes is syntactically valid, so a typo that still decodes to 32 bytes is
+indistinguishable from a real address — deleting the FIRST character of a
+44-character address does exactly that, measured. Shape is a floor, not a
+guarantee, so on `/add` the bot asks the chain whether the address has ever been
+used and says so. It reports rather than refuses: a real trader may have a fresh
+wallet, and on Robinhood Chain a fomo trader's own nonce is often 0 because a
+bundler sends their trades.
 
 **Exactly one chat may command it.** A Telegram bot can be messaged by anyone who
 knows its username, so `telegram.chatId` is the only thing between a stranger and
@@ -391,7 +422,7 @@ Needs Node 22+ (for the built-in WebSocket).
 ```sh
 npm install
 cp config.example.json config.json   # fill in Helius, Telegram, and the executor block
-npm test                             # 169 offline assertions, no network
+npm test                             # 183 offline assertions, no network
 npm run paper                        # detect + decide + simulate, sign nothing
 npm start
 ```
@@ -458,7 +489,7 @@ Each has a dedicated offline regression suite. Run it before and after.
 | `src/robinhood-trade.mjs` | `node test-rh.mjs` |
 | `src/aggregator.mjs` | `node test-aggregator.mjs` |
 | `src/executor.mjs`, `src/executor-io.mjs`, the wiring in `index.mjs` | `node test-executor.mjs` |
-| `src/control.mjs`, `src/control-io.mjs` | `node test-control.mjs` |
+| `src/control.mjs`, `src/control-io.mjs`, `src/roster-edit.mjs` | `node test-control.mjs` |
 
 `npm test` runs a syntax check across every file first — two syntax errors have
 already shipped in test files that nothing was executing.

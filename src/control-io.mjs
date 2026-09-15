@@ -49,7 +49,7 @@ export function saveControlState(path, state) {
  * @param {string} opts.botToken
  * @param {string|number} opts.chatId   the ONLY chat allowed to command this bot
  * @param {() => object} opts.snapshot  read-only view of the bot's state
- * @param {(action:string) => void} opts.onAction
+ * @param {(action:string, payload?:any) => void} opts.onAction
  * @param {(msg:string, extra?:object) => void} opts.log
  */
 export function startControl({ botToken, chatId, snapshot, onAction, log = () => {}, startedAt = Date.now() }) {
@@ -133,8 +133,8 @@ export function startControl({ botToken, chatId, snapshot, onAction, log = () =>
           if (!parsed) continue;
 
           stats.commands += 1;
-          const { action, reply } = decideCommand(parsed, snapshot());
-          if (action !== 'none') onAction(action);
+          const { action, reply, payload } = decideCommand(parsed, snapshot());
+          if (action !== 'none') onAction(action, payload);
           if (reply) await send(reply);
         }
       } catch (err) {
