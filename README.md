@@ -550,6 +550,46 @@ the trigger. **A wrong offset there would not throw.** It would watch nothing,
 forever, looking exactly like a launch that had not happened yet, which is why the
 test recomputes it from Meteora's IDL rather than trusting the number.
 
+### Several wallets, one launch
+
+A snipe can be split across wallets, each with its own size:
+
+```json
+"wallets": [
+  { "label": "w1", "keyEnv": "FIRSTFILL_SOLANA_KEY",   "amountIn": "150000000" },
+  { "label": "w2", "keyEnv": "FIRSTFILL_SOLANA_KEY_2", "amountIn": "80000000"  },
+  { "label": "w3", "keyEnv": "FIRSTFILL_SOLANA_KEY_3", "amountIn": "45000000"  }
+]
+```
+
+Keys are named, never stored: each entry gives the ENVIRONMENT VARIABLE holding
+that wallet's key. A key in the config file is a startup failure, as before.
+
+They share one subscription — the trigger is a property of the mint, not of who
+is buying — and they share the pool facts derived from it, so five wallets cost
+four PDA derivations rather than twenty. What is per-wallet is small: two token
+accounts, an amount, a signature.
+
+**Each wallet succeeds or fails on its own.** Three filling and two missing is a
+normal outcome, and `settled` reports every wallet by name with its state,
+signature and slot. Reporting one total would hide which wallets hold the token.
+
+A wallet short of wrapped quote or native SOL is **dropped at arm time with a
+warning**, not treated as fatal — four of five is still a snipe, and firing a
+fifth that cannot pay its own fee is not. Arming refuses only when no wallet is
+usable. `plan` reports the shortfall per wallet before you commit anything.
+
+Every wallet needs its own native SOL, not just its own wrapped balance: the
+token-account rent and the fee come out of plain lamports, about 0.0021 SOL plus
+the priority fee, per wallet.
+
+**What splitting does not do.** If the aim is to not read as one buyer, the bot
+cannot deliver that by itself. Five wallets buying one token in one block is
+itself a pattern, and funding them from one source links them in a single hop on
+any clustering tool. Different sizes help; common funding or synchronised timing
+does not. Independent funding paths are the part that matters, and they happen
+outside this repo.
+
 ### Everything is checked against Meteora's own SDK
 
 `src/meteora/dbc.mjs` hand-rolls the swap rather than calling

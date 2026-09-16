@@ -130,6 +130,43 @@ export function signSnipe({ instructions, payer, blockhash, keypair }) {
 }
 
 /**
+ * The facts about a pool that every buyer shares.
+ *
+ * With several wallets sniping one launch, the pool, its config and both vaults
+ * are identical for all of them — only the token accounts and the payer differ.
+ * Deriving them ONCE rather than per wallet is the difference between four PDA
+ * derivations and twenty, on the one path where milliseconds are the product.
+ *
+ * The quote-vault check is the same gate planFromLivePool applies, kept here so
+ * it runs once and protects every buyer at the same moment.
+ */
+export function poolFacts({ poolAddress, poolData, quoteMint }) {
+  const pool = decodeVirtualPool(poolData);
+  const poolKey = new PublicKey(poolAddress);
+  const baseVault = deriveTokenVault(poolKey, pool.baseMint);
+  const quoteVault = deriveTokenVault(poolKey, quoteMint);
+  if (baseVault.toBase58() !== pool.baseVault.toBase58()) {
+    throw new Error(`live pool reports base vault ${pool.baseVault.toBase58()}, derived ${baseVault.toBase58()}`);
+  }
+  if (quoteVault.toBase58() !== pool.quoteVault.toBase58()) {
+    throw new Error(`live pool quote vault ${pool.quoteVault.toBase58()} does not match one derived from quote mint ${quoteMint.toBase58()} — wrong quote mint configured`);
+  }
+  return { config: pool.config, baseMint: pool.baseMint, quoteMint, pool: poolKey, baseVault, quoteVault, creator: pool.creator };
+}
+
+/** One buyer's view of a pool whose facts are already established. */
+export function planForBuyer({ facts, buyer, tokenBaseProgram, tokenQuoteProgram, deriveAta }) {
+  return {
+    ...facts,
+    buyer,
+    tokenBaseProgram,
+    tokenQuoteProgram,
+    outputTokenAccount: deriveAta(buyer, facts.baseMint, tokenBaseProgram),
+    inputTokenAccount: deriveAta(buyer, facts.quoteMint, tokenQuoteProgram),
+  };
+}
+
+/**
  * Re-derive the vaults from a pool address we did NOT derive ourselves.
  *
  * Used only on the discovery path, where the pool arrived from a subscription

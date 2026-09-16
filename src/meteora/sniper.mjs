@@ -5,14 +5,23 @@
 // and before our bytes reach a leader is lost ground, so the design pushes every
 // cost to BEFORE the launch:
 //
-//   - the pool address is a PDA of (config, base mint, quote mint), so it is
-//     known while the pool is still nothing
-//   - the vaults and both token accounts are PDAs of that
-//   - the quote token account is funded in advance, so no wrapping at fire time
-//   - the transaction is compiled and SIGNED in advance, re-signed only when the
-//     blockhash rolls
+//   - where the config is known, the pool address is a PDA of it, so it and both
+//     vaults and every token account are known while the pool is still nothing
+//   - the quote token accounts are funded in advance, so no wrapping at fire time
+//   - the transactions are compiled and SIGNED in advance, re-signed only when
+//     the blockhash rolls
 //
 // What is left at fire time is a socket write. That is the point.
+//
+// SEVERAL BUYERS, ONE LAUNCH. A snipe may be split across wallets. They share one
+// subscription — the trigger is a property of the mint, not of who is buying —
+// and they share the pool facts derived from it, so five wallets cost four PDA
+// derivations rather than twenty. What is per-wallet is small and known early:
+// two token accounts, an amount, a signature.
+//
+// Each wallet succeeds or fails ON ITS OWN. Three filling and two missing is a
+// normal outcome, not an error, and reporting it as one total would hide which
+// wallets actually hold the token.
 //
 // TWO TRIGGERS, because they fail differently:
 //   accountSubscribe on the derived pool  — cheapest and most widely supported,
@@ -31,16 +40,31 @@ import {
   DBC_PROGRAM_ID, VIRTUAL_POOL, TOKEN_PROGRAM, TOKEN_2022_PROGRAM,
   planSnipe, decodePoolConfig, deriveAta, tokenProgramFor,
 } from './dbc.mjs';
-import { verifyPool, snipeInstructions, signSnipe, planFromLivePool, REFUSE } from './snipe.mjs';
-import { getAccount, getTokenBalance, getBalance, sendRawTransaction, getSignatureStatuses, BlockhashCache } from './rpc.mjs';
+import {
+  verifyPool, snipeInstructions, signSnipe, poolFacts, planForBuyer, REFUSE,
+} from './snipe.mjs';
+import {
+  getAccount, getTokenBalance, getBalance, sendRawTransaction, getSignatureStatuses, BlockhashCache,
+} from './rpc.mjs';
 
 export const STATE = Object.freeze({
   IDLE: 'idle',
   ARMED: 'armed',
   FIRING: 'firing',
+  SETTLED: 'settled',
+});
+
+export const BUYER_STATE = Object.freeze({
+  WAITING: 'waiting',
+  FIRING: 'firing',
   FILLED: 'filled',
+  FAILED: 'failed',
   ABANDONED: 'abandoned',
 });
+
+/** Rent for a token account, rounded up. What the snipe pays to open its output. */
+const ATA_RENT_LAMPORTS = 2_100_000n;
+const BASE_FEE_LAMPORTS = 5_000n;
 
 export class DbcSniper extends EventEmitter {
   /**
@@ -51,37 +75,64 @@ export class DbcSniper extends EventEmitter {
    * @param {PublicKey} o.mint        the token, known in advance
    * @param {PublicKey} o.quoteMint   what we pay in
    * @param {PublicKey} [o.config]    the DBC config; supply it for a pre-signed snipe
-   * @param {Keypair} o.keypair       the buyer
-   * @param {bigint} o.amountIn       raw quote units to spend
-   * @param {bigint} o.minimumAmountOut  raw base units below which the swap must fail
+   * @param {Array<{keypair: Keypair, amountIn: bigint, minimumAmountOut: bigint, label?: string}>} o.buyers
    * @param {boolean} [o.dryRun]      do everything except put bytes on the wire
    */
   constructor({
-    wsUrl, httpUrl, sendUrls, mint, quoteMint, config = null, keypair,
-    amountIn, minimumAmountOut,
-    // The base mint does not exist before the launch, so its token program cannot
-    // be read — but it CAN be known, from any earlier launch by the same
-    // launchpad. Supplying it is what removes the last round trip from the hot
-    // path on the discovery route.
+    wsUrl, httpUrl, sendUrls, mint, quoteMint, config = null,
+    buyers,
+    // Single-buyer shorthand, so the common case does not have to build a list.
+    keypair, amountIn, minimumAmountOut,
     baseTokenProgram = null,
     computeUnitLimit = 250_000, computeUnitPriceMicroLamports = 1_000_000,
     resendMs = 400, fireWindowMs = 30_000, confirmPollMs = 1000,
     dryRun = false,
-    // A seam, so the trigger path can be driven by a fake socket in tests. The
-    // race logic is the part most worth testing and the hardest to reach live.
     wsFactory = (url) => new WebSocket(url),
+    // A seam, like wsFactory: partial outcomes across wallets are the part most
+    // worth testing and the hardest to stage live.
+    statusFetcher = null,
   }) {
     super();
+
+    const list = buyers?.length
+      ? buyers
+      : (keypair ? [{ keypair, amountIn, minimumAmountOut }] : []);
+    if (!list.length) throw new Error('DbcSniper: no buyers — pass buyers[], or keypair + amountIn');
+
+    this.buyers = list.map((b, i) => {
+      if (!b.keypair) throw new Error(`buyer ${i}: no keypair`);
+      if (typeof b.amountIn !== 'bigint' || b.amountIn <= 0n) throw new Error(`buyer ${i}: amountIn must be a positive bigint`);
+      if (typeof b.minimumAmountOut !== 'bigint' || b.minimumAmountOut < 0n) throw new Error(`buyer ${i}: minimumAmountOut must be a non-negative bigint`);
+      return {
+        index: i,
+        label: b.label ?? `w${i + 1}`,
+        keypair: b.keypair,
+        address: b.keypair.publicKey,
+        amountIn: b.amountIn,
+        minimumAmountOut: b.minimumAmountOut,
+        plan: null,
+        presigned: null,
+        signature: null,
+        quoteAta: null,
+        state: BUYER_STATE.WAITING,
+      };
+    });
+
+    // The same wallet twice would sign two transactions spending the same
+    // wrapped balance; the second fails on chain having paid a fee.
+    const seen = new Set();
+    for (const b of this.buyers) {
+      const k = b.address.toBase58();
+      if (seen.has(k)) throw new Error(`DbcSniper: wallet ${k} appears more than once`);
+      seen.add(k);
+    }
+
     this.wsUrl = wsUrl;
     this.httpUrl = httpUrl;
     this.sendUrls = sendUrls?.length ? sendUrls : [httpUrl];
     this.mint = mint;
     this.quoteMint = quoteMint;
     this.config = config;
-    this.keypair = keypair;
-    this.buyer = keypair.publicKey;
-    this.amountIn = amountIn;
-    this.minimumAmountOut = minimumAmountOut;
     this.computeUnitLimit = computeUnitLimit;
     this.computeUnitPriceMicroLamports = computeUnitPriceMicroLamports;
     this.resendMs = resendMs;
@@ -89,10 +140,9 @@ export class DbcSniper extends EventEmitter {
     this.confirmPollMs = confirmPollMs;
     this.dryRun = dryRun;
     this.wsFactory = wsFactory;
+    this.statusFetcher = statusFetcher ?? ((sigs) => getSignatureStatuses(this.httpUrl, sigs));
 
     this.state = STATE.IDLE;
-    this.plan = null;          // pre-armed only
-    this.presigned = null;     // pre-armed only
     this.quoteTokenProgram = null;
     this.baseTokenProgram = baseTokenProgram;
     this.blockhashes = new BlockhashCache(httpUrl, { onError: (e) => this.emit('warn', { at: 'blockhash', message: e.message }) });
@@ -105,17 +155,30 @@ export class DbcSniper extends EventEmitter {
     this.attempt = 0;
 
     this.stats = { sends: 0, sendErrors: 0, reconnects: 0, triggers: 0, resigns: 0 };
-    this.timeline = {};        // what happened when, for an honest latency report
+    this.timeline = {};
+  }
+
+  /** The priority fee this budget costs if every unit is consumed. */
+  get priorityFeeLamports() {
+    return BigInt(this.computeUnitLimit) * BigInt(this.computeUnitPriceMicroLamports) / 1_000_000n;
+  }
+
+  /** What one wallet needs in plain SOL, beyond its wrapped balance. */
+  get perWalletLamportsNeeded() {
+    return this.priorityFeeLamports + BASE_FEE_LAMPORTS + ATA_RENT_LAMPORTS;
   }
 
   #mark(name) { this.timeline[name] = Date.now(); this.emit('mark', { name, at: this.timeline[name] }); }
 
   /**
    * Resolve everything that can be resolved before the launch, and refuse to arm
-   * if anything needed at fire time is missing.
+   * if anything needed at fire time is missing — for EVERY wallet.
    *
-   * Refusing here is the whole value: every check below is one that would
-   * otherwise fail DURING the race, when there is no time to fix it.
+   * One underfunded wallet is not a reason to abandon the launch, but it is a
+   * reason to say so now rather than discover it mid-race. Arming refuses only
+   * when no wallet is usable; the rest are reported and dropped, because a snipe
+   * with four of five wallets is still a snipe and silently firing a fifth that
+   * cannot pay is not.
    */
   async arm() {
     await this.blockhashes.start();
@@ -130,98 +193,93 @@ export class DbcSniper extends EventEmitter {
       throw new Error(`arm: quote mint is owned by ${this.quoteTokenProgram.toBase58()}, which is not a token program`);
     }
 
-    // The money has to be sitting in the quote token account already. Wrapping SOL
-    // inside the snipe transaction would add instructions and rent to the hot path
-    // for something that could have been done an hour earlier.
-    const quoteAta = deriveAta(this.buyer, this.quoteMint, this.quoteTokenProgram);
-    const balance = await getTokenBalance(this.httpUrl, quoteAta.toBase58(), { commitment: 'confirmed' });
-    if (balance === null) {
-      throw new Error(`arm: quote token account ${quoteAta.toBase58()} does not exist — run \`npm run snipe -- prepare\` first`);
-    }
-    if (balance < this.amountIn) {
-      throw new Error(`arm: quote token account holds ${balance}, need ${this.amountIn}`);
-    }
-    this.emit('info', { at: 'arm', quoteAta: quoteAta.toBase58(), balance: balance.toString(), tokenProgram: this.quoteTokenProgram.toBase58() });
-
-    // NATIVE SOL, WHICH IS NOT THE SAME MONEY.
-    //
-    // The buy is spent from the wrapped account checked above, but the
-    // transaction itself is paid for in plain lamports — and it opens a token
-    // account for a mint that does not exist yet, so it pays rent for that too.
-    // Wrapping every last lamport leaves a wallet that is fully funded to buy and
-    // unable to send, and the way that fails is the snipe going out and being
-    // dropped for an unfunded fee payer, mid-race, with the launch not repeating.
-    const lamports = await getBalance(this.httpUrl, this.buyer.toBase58(), { commitment: 'confirmed' });
-    // Priority fee is priced per compute unit in micro-lamports, so the budget
-    // costs limit * price / 1e6 lamports if every unit is consumed.
-    const priorityFee = BigInt(this.computeUnitLimit) * BigInt(this.computeUnitPriceMicroLamports) / 1_000_000n;
-    const BASE_FEE = 5_000n;             // one signature
-    const ATA_RENT = 2_100_000n;         // rent exemption for the output token account, rounded up
-    const needed = priorityFee + BASE_FEE + ATA_RENT;
-
-    if (lamports < needed) {
-      throw new Error(
-        `arm: wallet holds ${lamports} lamports of native SOL, needs at least ${needed} `
-        + `(${ATA_RENT} rent for the token account the snipe creates, ${priorityFee} priority fee, ${BASE_FEE} base fee). `
-        + 'Send more SOL — do not unwrap, that would leave the buy short.',
-      );
-    }
-    this.emit('info', {
-      at: 'arm', nativeLamports: lamports.toString(), needed: needed.toString(),
-      breakdown: { ataRent: ATA_RENT.toString(), priorityFee: priorityFee.toString(), baseFee: BASE_FEE.toString() },
-      headroom: (lamports - needed).toString(),
-    });
-
+    // The config, if we have one, decides the base token program and must agree
+    // with the currency every wallet funded.
+    let poolConfig = null;
     if (this.config) {
       const cfgAccount = await getAccount(this.httpUrl, this.config.toBase58(), { commitment: 'confirmed' });
       if (!cfgAccount) throw new Error(`arm: config ${this.config.toBase58()} does not exist`);
       if (cfgAccount.owner !== DBC_PROGRAM_ID.toBase58()) {
         throw new Error(`arm: config ${this.config.toBase58()} is owned by ${cfgAccount.owner}, not the DBC program`);
       }
-      const cfg = decodePoolConfig(cfgAccount.data);
-
-      // The config names the currency the curve trades against. If that is not
-      // what we funded, the derived pool is a different pool and the snipe would
-      // be aimed at nothing.
-      if (cfg.quoteMint.toBase58() !== this.quoteMint.toBase58()) {
-        throw new Error(`arm: config quotes ${cfg.quoteMint.toBase58()} but we funded ${this.quoteMint.toBase58()}`);
+      poolConfig = decodePoolConfig(cfgAccount.data);
+      if (poolConfig.quoteMint.toBase58() !== this.quoteMint.toBase58()) {
+        throw new Error(`arm: config quotes ${poolConfig.quoteMint.toBase58()} but we funded ${this.quoteMint.toBase58()}`);
       }
-      this.baseTokenProgram = tokenProgramFor(cfg.tokenType);
+      this.baseTokenProgram = tokenProgramFor(poolConfig.tokenType);
+    }
 
-      this.plan = planSnipe({
-        config: this.config, baseMint: this.mint, quoteMint: this.quoteMint, buyer: this.buyer,
-        baseTokenType: cfg.tokenType, quoteTokenType: cfg.quoteTokenFlag,
+    const needed = this.perWalletLamportsNeeded;
+    const usable = [];
+
+    for (const b of this.buyers) {
+      const quoteAta = deriveAta(b.address, this.quoteMint, this.quoteTokenProgram);
+      b.quoteAta = quoteAta;
+
+      const [wrapped, lamports] = await Promise.all([
+        getTokenBalance(this.httpUrl, quoteAta.toBase58(), { commitment: 'confirmed' }),
+        getBalance(this.httpUrl, b.address.toBase58(), { commitment: 'confirmed' }),
+      ]);
+
+      const problems = [];
+      if (wrapped === null) problems.push(`quote token account ${quoteAta.toBase58()} does not exist — run prepare`);
+      else if (wrapped < b.amountIn) problems.push(`quote account holds ${wrapped}, needs ${b.amountIn}`);
+      if (lamports < needed) problems.push(`holds ${lamports} lamports of native SOL, needs ${needed} (${ATA_RENT_LAMPORTS} rent + ${this.priorityFeeLamports} priority + ${BASE_FEE_LAMPORTS} base fee)`);
+
+      if (problems.length) {
+        b.state = BUYER_STATE.ABANDONED;
+        this.emit('wallet-unusable', {
+          label: b.label, address: b.address.toBase58(), problems,
+        });
+        continue;
+      }
+
+      this.emit('wallet-ready', {
+        label: b.label,
+        address: b.address.toBase58(),
+        amountIn: b.amountIn.toString(),
+        quoteAta: quoteAta.toBase58(),
+        wrapped: wrapped.toString(),
+        nativeLamports: lamports.toString(),
+        headroom: (lamports - needed).toString(),
       });
 
-      // If the pool is already there, we are not sniping a launch — we are late.
-      // Say so rather than firing into a curve that has already moved.
-      const existing = await getAccount(this.httpUrl, this.plan.pool.toBase58(), { commitment: 'confirmed' });
-      if (existing) {
-        this.emit('warn', { at: 'arm', message: `pool ${this.plan.pool.toBase58()} ALREADY EXISTS — this launch has happened` });
+      if (this.config && poolConfig) {
+        b.plan = planSnipe({
+          config: this.config, baseMint: this.mint, quoteMint: this.quoteMint, buyer: b.address,
+          baseTokenType: poolConfig.tokenType, quoteTokenType: poolConfig.quoteTokenFlag,
+        });
       }
+      usable.push(b);
+    }
 
-      this.#resign();
-      this.blockhashes.onRefresh = () => { if (!this.fired) this.#resign(); };
+    if (!usable.length) {
+      throw new Error('arm: no wallet is usable — every one is short of wrapped quote, native SOL, or both');
+    }
+
+    if (this.config) {
+      const existing = await getAccount(this.httpUrl, usable[0].plan.pool.toBase58(), { commitment: 'confirmed' });
+      if (existing) {
+        this.emit('warn', { at: 'arm', message: `pool ${usable[0].plan.pool.toBase58()} ALREADY EXISTS — this launch has happened` });
+      }
+      this.#resignAll();
+      this.blockhashes.onRefresh = () => { if (!this.fired) this.#resignAll(); };
       this.emit('armed', {
         mode: 'pre-signed',
-        pool: this.plan.pool.toBase58(),
-        baseVault: this.plan.baseVault.toBase58(),
-        quoteVault: this.plan.quoteVault.toBase58(),
-        outputTokenAccount: this.plan.outputTokenAccount.toBase58(),
-        txBytes: this.presigned.bytes,
-        poolExists: Boolean(existing),
+        wallets: usable.length,
+        skipped: this.buyers.length - usable.length,
+        pool: usable[0].plan.pool.toBase58(),
+        totalAmountIn: usable.reduce((s, b) => s + b.amountIn, 0n).toString(),
       });
     } else {
-      // Discovery path. The pool address is unknowable until it exists, so the
-      // transaction cannot be pre-signed and the base token program has to be
-      // read at fire time. Slower, and honest about being slower.
-      // Everything derivable without the config, derived now. What is left at
-      // fire time is: decode the notification, derive two vaults, sign, send.
       this.emit('armed', {
         mode: 'discovery',
-        note: 'no config supplied: the pool address is unknowable in advance, so the transaction is built at fire time',
+        wallets: usable.length,
+        skipped: this.buyers.length - usable.length,
+        note: 'no config supplied: the pool address is unknowable in advance, so transactions are built at fire time',
         baseTokenProgram: this.baseTokenProgram?.toBase58() ?? null,
         roundTripsAtFire: this.baseTokenProgram ? 0 : 1,
+        totalAmountIn: usable.reduce((s, b) => s + b.amountIn, 0n).toString(),
         advice: this.baseTokenProgram
           ? 'nothing is fetched at fire time'
           : 'set snipe.baseTokenProgram to remove the one remaining fetch from the race',
@@ -230,22 +288,59 @@ export class DbcSniper extends EventEmitter {
 
     this.state = STATE.ARMED;
     this.#mark('armed');
+
+    // Warm the paths that will run at fire time. They are JIT-cold otherwise, and
+    // the first live fill measured 48ms to build and sign one transaction — work
+    // that takes a few milliseconds once the code is hot. This costs nothing now
+    // and is the cheapest latency available.
+    this.#warm();
+
     return this.state;
   }
 
-  /** Re-sign against the current blockhash. Background work, never on the hot path. */
-  #resign() {
-    if (!this.plan) return;
-    const instructions = snipeInstructions({
-      plan: this.plan,
-      amountIn: this.amountIn,
-      minimumAmountOut: this.minimumAmountOut,
-      computeUnitLimit: this.computeUnitLimit,
-      computeUnitPriceMicroLamports: this.computeUnitPriceMicroLamports,
-    });
-    this.presigned = signSnipe({
-      instructions, payer: this.buyer, blockhash: this.blockhashes.blockhash, keypair: this.keypair,
-    });
+  /**
+   * Run one throwaway derivation and signature so the hot path is compiled.
+   *
+   * Uses a plan that cannot be confused with a real one: the buyer's own key as a
+   * stand-in config, and the result discarded. Nothing is sent.
+   */
+  #warm() {
+    try {
+      const b = this.buyers.find((x) => x.state !== BUYER_STATE.ABANDONED);
+      if (!b || !this.blockhashes.blockhash) return;
+      const started = Date.now();
+      const throwaway = planSnipe({
+        config: b.address, baseMint: this.mint, quoteMint: this.quoteMint, buyer: b.address,
+        baseTokenType: 0, quoteTokenType: 0,
+      });
+      signSnipe({
+        instructions: snipeInstructions({
+          plan: throwaway, amountIn: 1n, minimumAmountOut: 0n,
+          computeUnitLimit: this.computeUnitLimit,
+          computeUnitPriceMicroLamports: this.computeUnitPriceMicroLamports,
+        }),
+        payer: b.address, blockhash: this.blockhashes.blockhash, keypair: b.keypair,
+      });
+      this.emit('info', { at: 'warm', message: 'hot path compiled', ms: Date.now() - started });
+    } catch (e) {
+      // Warming is an optimisation. Failing it must not stop an armed sniper.
+      this.emit('warn', { at: 'warm', message: e.message });
+    }
+  }
+
+  #resignAll() {
+    for (const b of this.buyers) {
+      if (!b.plan || b.state === BUYER_STATE.ABANDONED) continue;
+      b.presigned = signSnipe({
+        instructions: snipeInstructions({
+          plan: b.plan, amountIn: b.amountIn, minimumAmountOut: b.minimumAmountOut,
+          computeUnitLimit: this.computeUnitLimit,
+          computeUnitPriceMicroLamports: this.computeUnitPriceMicroLamports,
+        }),
+        payer: b.address, blockhash: this.blockhashes.blockhash, keypair: b.keypair,
+      });
+      b.signature = b.presigned.signature;
+    }
     this.stats.resigns++;
   }
 
@@ -272,9 +367,6 @@ export class DbcSniper extends EventEmitter {
 
     ws.addEventListener('open', () => {
       this.attempt = 0;
-
-      // Discovery trigger. dataSize plus a memcmp on base_mint is exact: only this
-      // token's pool can match, so there is no filtering to do on arrival.
       this.#send({
         method: 'programSubscribe',
         params: [
@@ -290,16 +382,15 @@ export class DbcSniper extends EventEmitter {
         ],
       }, 'program');
 
-      // Pre-armed trigger. accountSubscribe on an account that does not exist yet
-      // is legal and fires when it is created.
-      if (this.plan) {
+      const armedPlan = this.buyers.find((b) => b.plan)?.plan;
+      if (armedPlan) {
         this.#send({
           method: 'accountSubscribe',
-          params: [this.plan.pool.toBase58(), { encoding: 'base64', commitment: 'processed' }],
+          params: [armedPlan.pool.toBase58(), { encoding: 'base64', commitment: 'processed' }],
         }, 'account');
       }
 
-      this.emit('open', { triggers: this.plan ? ['programSubscribe', 'accountSubscribe'] : ['programSubscribe'] });
+      this.emit('open', { triggers: armedPlan ? ['programSubscribe', 'accountSubscribe'] : ['programSubscribe'] });
     });
 
     ws.addEventListener('message', (ev) => this.#onMessage(ev));
@@ -308,8 +399,6 @@ export class DbcSniper extends EventEmitter {
       if (this.stopped) return;
       this.stats.reconnects++;
       this.emit('closed', { code: ev.code });
-      // Tight backoff: every millisecond disconnected is a millisecond in which
-      // the launch cannot be seen at all.
       const ceiling = Math.min(2000, 100 * 2 ** this.attempt++);
       setTimeout(() => this.#connect(), Math.random() * ceiling);
     });
@@ -330,8 +419,6 @@ export class DbcSniper extends EventEmitter {
       return;
     }
     if (msg.id !== undefined && msg.error) {
-      // A provider that refuses programSubscribe is a real operational fact, not
-      // a warning to bury: on the discovery path it is the ONLY trigger.
       this.emit('warn', { at: 'subscribe', message: msg.error?.message ?? 'subscribe rejected', via: this.subs.get(msg.id) });
       return;
     }
@@ -344,7 +431,8 @@ export class DbcSniper extends EventEmitter {
     const slot = msg.params?.result?.context?.slot ?? null;
     if (!value) return;
 
-    const poolAddress = method === 'programNotification' ? value.pubkey : this.plan?.pool.toBase58();
+    const armedPlan = this.buyers.find((b) => b.plan)?.plan;
+    const poolAddress = method === 'programNotification' ? value.pubkey : armedPlan?.pool.toBase58();
     const encoded = method === 'programNotification' ? value.account?.data : value.data;
     if (!poolAddress || !encoded) return;
     const data = Buffer.from(encoded[0], 'base64');
@@ -352,65 +440,49 @@ export class DbcSniper extends EventEmitter {
     this.stats.triggers++;
     this.emit('trigger', { via: method, pool: poolAddress, slot, seenAt, bytes: data.length });
 
-    if (this.fired) return;    // both triggers firing on one launch is expected
+    if (this.fired) return;
     this.fired = true;
     this.#mark('trigger');
-    this.#fire({ poolAddress, data, slot, seenAt }).catch((e) => {
-      this.state = STATE.ABANDONED;
+    this.#fire({ poolAddress, data, slot }).catch((e) => {
+      this.state = STATE.SETTLED;
       this.emit('error', { at: 'fire', message: e.message });
     });
   }
 
   async #fire({ poolAddress, data, slot }) {
     this.state = STATE.FIRING;
+    const live = this.buyers.filter((b) => b.state !== BUYER_STATE.ABANDONED);
 
-    let payload = this.presigned;
+    // Was the pool the one we armed against? Checked once — every wallet armed
+    // against the same config, so they agree or they all disagree.
+    const armed = live.find((b) => b.plan);
+    let replan = !armed;
 
-    if (this.plan) {
-      // Pre-armed: prove the pool is the one we armed against. Byte comparisons,
-      // no network.
-      const check = verifyPool({ poolAddress, data, plan: this.plan });
-
+    if (armed) {
+      const check = verifyPool({ poolAddress, data, plan: armed.plan });
       if (!check.ok && (check.reason === REFUSE.POOL_MISMATCH || check.reason === REFUSE.CONFIG_MISMATCH)) {
-        // NOT a refusal, and this is the common case on some launchpads.
-        //
-        // A pool at an address we did not derive, under a config we did not
-        // expect, is exactly what happens when the launchpad mints a FRESH config
-        // per launch — the config is generated in the same bundle as the pool, so
-        // no config supplied in advance can be right. But the mint is right: the
-        // memcmp filter cannot match any other token, and verifyPool checks the
-        // mint before it checks anything else, so reaching here means the base
-        // mint already matched.
-        //
-        // Refusing here would mean refusing to buy the correct token at the one
-        // moment it can be bought, because a speed optimisation guessed wrong.
-        // So the plan is thrown away and rebuilt from the pool in front of us.
+        // The launchpad minted a config we could not have known. The mint still
+        // matched — verifyPool checks that first — so this is the right token at
+        // an address we did not predict. Rebuild rather than refuse.
         this.emit('replanned', {
           why: check.reason,
-          armedPool: this.plan.pool.toBase58(),
+          armedPool: armed.plan.pool.toBase58(),
           actualPool: poolAddress,
           note: 'the config was not the one this launch used — rebuilding from the live pool',
         });
-        this.plan = null;
-        payload = null;
+        replan = true;
       } else if (!check.ok) {
-        // Wrong mint, or vaults that do not derive from what we funded. These are
-        // not guesses that missed; they are the pool not being what it claims.
-        this.state = STATE.ABANDONED;
+        this.state = STATE.SETTLED;
+        for (const b of live) b.state = BUYER_STATE.ABANDONED;
         this.emit('refused', { reason: check.reason, detail: check.detail });
         return;
       } else if (this.blockhashes.ageMs > 45_000) {
         this.emit('warn', { at: 'fire', message: `blockhash is ${this.blockhashes.ageMs}ms old, re-signing` });
-        this.#resign();
-        payload = this.presigned;
+        this.#resignAll();
       }
     }
 
-    if (!this.plan) {
-      // Discovery. Everything needed is in the notification itself: the pool
-      // account carries its config and both vaults, so there is nothing to fetch —
-      // PROVIDED the base token program was resolved in advance. When it was not,
-      // one read happens here, and it is the only round trip in the hot path.
+    if (replan) {
       if (!this.baseTokenProgram) {
         this.emit('warn', {
           at: 'fire',
@@ -421,86 +493,145 @@ export class DbcSniper extends EventEmitter {
         this.baseTokenProgram = new PublicKey(baseMintAccount.owner);
       }
 
-      const plan = planFromLivePool({
-        poolAddress, poolData: data, buyer: this.buyer, quoteMint: this.quoteMint,
-        tokenBaseProgram: this.baseTokenProgram, tokenQuoteProgram: this.quoteTokenProgram,
-        deriveAta,
-      });
-      this.plan = plan;
-      const instructions = snipeInstructions({
-        plan, amountIn: this.amountIn, minimumAmountOut: this.minimumAmountOut,
-        computeUnitLimit: this.computeUnitLimit, computeUnitPriceMicroLamports: this.computeUnitPriceMicroLamports,
-      });
-      payload = signSnipe({ instructions, payer: this.buyer, blockhash: this.blockhashes.blockhash, keypair: this.keypair });
+      // Derived ONCE and shared: the pool, its config and both vaults are the
+      // same for every wallet buying this launch.
+      const facts = poolFacts({ poolAddress, poolData: data, quoteMint: this.quoteMint });
+      for (const b of live) {
+        b.plan = planForBuyer({
+          facts, buyer: b.address,
+          tokenBaseProgram: this.baseTokenProgram,
+          tokenQuoteProgram: this.quoteTokenProgram,
+          deriveAta,
+        });
+        b.presigned = signSnipe({
+          instructions: snipeInstructions({
+            plan: b.plan, amountIn: b.amountIn, minimumAmountOut: b.minimumAmountOut,
+            computeUnitLimit: this.computeUnitLimit,
+            computeUnitPriceMicroLamports: this.computeUnitPriceMicroLamports,
+          }),
+          payer: b.address, blockhash: this.blockhashes.blockhash, keypair: b.keypair,
+        });
+        b.signature = b.presigned.signature;
+      }
     }
 
     this.#mark('built');
-    this.signature = payload.signature;
+    for (const b of live) b.state = BUYER_STATE.FIRING;
+
     this.emit('firing', {
-      signature: payload.signature, pool: poolAddress, slot,
-      amountIn: this.amountIn.toString(), minimumAmountOut: this.minimumAmountOut.toString(),
+      wallets: live.length,
+      pool: poolAddress,
+      slot,
+      totalAmountIn: live.reduce((s, b) => s + b.amountIn, 0n).toString(),
       triggerToBuildMs: this.timeline.built - this.timeline.trigger,
       dryRun: this.dryRun,
+      signatures: live.map((b) => ({ label: b.label, signature: b.signature, amountIn: b.amountIn.toString() })),
     });
 
     if (this.dryRun) {
-      this.state = STATE.ABANDONED;
-      this.emit('dry-run', { signature: payload.signature, note: 'nothing was sent' });
+      this.state = STATE.SETTLED;
+      for (const b of live) b.state = BUYER_STATE.ABANDONED;
+      this.emit('dry-run', { wallets: live.length, note: 'nothing was sent' });
       return;
     }
 
-    this.#blast(payload.base64);
+    this.#blastAll(live);
     this.#mark('sent');
 
-    // Keep re-sending the SAME bytes. A transaction is identified by its
-    // signature, so a duplicate that lands twice is still one fill — but a single
-    // send that a leader drops is no fill at all, and at a launch the mempool is
-    // exactly where drops happen.
-    this.resendTimer = setInterval(() => this.#blast(payload.base64), this.resendMs);
-    this.confirmTimer = setInterval(() => this.#checkFill(payload.signature), this.confirmPollMs);
+    this.resendTimer = setInterval(() => {
+      const pending = this.buyers.filter((b) => b.state === BUYER_STATE.FIRING);
+      if (!pending.length) { clearInterval(this.resendTimer); return; }
+      this.#blastAll(pending);
+    }, this.resendMs);
+
+    this.confirmTimer = setInterval(() => this.#checkFills(), this.confirmPollMs);
+
     setTimeout(() => {
-      if (this.state === STATE.FIRING) {
-        clearInterval(this.resendTimer);
-        clearInterval(this.confirmTimer);
-        this.state = STATE.ABANDONED;
-        this.emit('abandoned', { signature: payload.signature, afterMs: this.fireWindowMs });
+      const pending = this.buyers.filter((b) => b.state === BUYER_STATE.FIRING);
+      if (pending.length) {
+        for (const b of pending) b.state = BUYER_STATE.ABANDONED;
+        this.emit('abandoned', {
+          wallets: pending.map((b) => ({ label: b.label, signature: b.signature })),
+          afterMs: this.fireWindowMs,
+        });
       }
+      this.#settleIfDone();
     }, this.fireWindowMs).unref?.();
   }
 
-  #blast(base64) {
-    for (const url of this.sendUrls) {
-      sendRawTransaction(url, base64)
-        .then(({ signature, error }) => {
-          this.stats.sends++;
-          if (error) { this.stats.sendErrors++; this.emit('send-error', { url, message: error }); }
-          else this.emit('sent', { url, signature });
-        })
-        .catch((e) => { this.stats.sendErrors++; this.emit('send-error', { url, message: e.message }); });
+  #blastAll(buyers) {
+    for (const b of buyers) {
+      for (const url of this.sendUrls) {
+        sendRawTransaction(url, b.presigned.base64)
+          .then(({ signature, error }) => {
+            this.stats.sends++;
+            if (error) { this.stats.sendErrors++; this.emit('send-error', { label: b.label, url, message: error }); }
+            else this.emit('sent', { label: b.label, url, signature });
+          })
+          .catch((e) => { this.stats.sendErrors++; this.emit('send-error', { label: b.label, url, message: e.message }); });
+      }
     }
   }
 
-  async #checkFill(signature) {
+  async #checkFills() {
+    const pending = this.buyers.filter((b) => b.state === BUYER_STATE.FIRING);
+    if (!pending.length) { this.#settleIfDone(); return; }
     try {
-      const [status] = await getSignatureStatuses(this.httpUrl, [signature]);
-      if (!status) return;
-      clearInterval(this.resendTimer);
-      clearInterval(this.confirmTimer);
-      this.#mark('landed');
-      if (status.err) {
-        this.state = STATE.ABANDONED;
-        this.emit('failed', { signature, err: status.err, slot: status.slot });
-        return;
-      }
-      this.state = STATE.FILLED;
-      this.emit('filled', {
-        signature, slot: status.slot, confirmations: status.confirmations,
-        triggerToLandedMs: this.timeline.landed - this.timeline.trigger,
-        outputTokenAccount: this.plan?.outputTokenAccount.toBase58() ?? null,
+      const statuses = await this.statusFetcher(pending.map((b) => b.signature));
+      statuses.forEach((status, i) => {
+        if (!status) return;
+        const b = pending[i];
+        if (status.err) {
+          b.state = BUYER_STATE.FAILED;
+          this.emit('wallet-failed', { label: b.label, address: b.address.toBase58(), signature: b.signature, err: status.err, slot: status.slot });
+          return;
+        }
+        b.state = BUYER_STATE.FILLED;
+        b.filledSlot = status.slot;
+        this.emit('wallet-filled', {
+          label: b.label,
+          address: b.address.toBase58(),
+          signature: b.signature,
+          slot: status.slot,
+          amountIn: b.amountIn.toString(),
+          outputTokenAccount: b.plan?.outputTokenAccount.toBase58() ?? null,
+          triggerToLandedMs: Date.now() - this.timeline.trigger,
+        });
       });
+      this.#settleIfDone();
     } catch (e) {
       this.emit('warn', { at: 'confirm', message: e.message });
     }
+  }
+
+  /** Report once, when no wallet is still in flight. */
+  #settleIfDone() {
+    if (this.state === STATE.SETTLED) return;
+    if (this.buyers.some((b) => b.state === BUYER_STATE.FIRING)) return;
+
+    clearInterval(this.resendTimer);
+    clearInterval(this.confirmTimer);
+    this.state = STATE.SETTLED;
+    this.#mark('settled');
+
+    const filled = this.buyers.filter((b) => b.state === BUYER_STATE.FILLED);
+    const failed = this.buyers.filter((b) => b.state === BUYER_STATE.FAILED);
+    const missed = this.buyers.filter((b) => b.state === BUYER_STATE.ABANDONED);
+
+    this.emit('settled', {
+      filled: filled.length,
+      failed: failed.length,
+      missed: missed.length,
+      totalSpent: filled.reduce((s, b) => s + b.amountIn, 0n).toString(),
+      wallets: this.buyers.map((b) => ({
+        label: b.label,
+        address: b.address.toBase58(),
+        state: b.state,
+        amountIn: b.amountIn.toString(),
+        signature: b.signature,
+        slot: b.filledSlot ?? null,
+      })),
+    });
   }
 }
 

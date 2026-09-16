@@ -256,15 +256,18 @@ function armedSniper(over = {}) {
     wsFactory: () => { socket = new FakeSocket(); return socket; },
     ...over,
   });
-  sniper.plan = PLAN;
-  // arm() resolves this from the quote mint's account owner; there is no arm()
-  // here, so it is set the same way arm() would.
+  // arm() resolves these from the chain; there is no arm() here, so they are set
+  // the same way arm() would set them.
   sniper.quoteTokenProgram = TOKEN_PROGRAM;
   sniper.blockhashes.current = { blockhash: BLOCKHASH, lastValidBlockHeight: 1, at: Date.now() };
-  sniper.presigned = signSnipe({
-    instructions: snipeInstructions({ plan: PLAN, amountIn: 250_000_000n, minimumAmountOut: 1n, computeUnitLimit: 250_000, computeUnitPriceMicroLamports: 1_000_000 }),
-    payer: BUYER, blockhash: BLOCKHASH, keypair: BUYER_KP,
-  });
+  for (const b of sniper.buyers) {
+    b.plan = planSnipe({ config: CONFIG, baseMint: MINT, quoteMint: WSOL_MINT, buyer: b.address, baseTokenType: 0, quoteTokenType: 0 });
+    b.presigned = signSnipe({
+      instructions: snipeInstructions({ plan: b.plan, amountIn: b.amountIn, minimumAmountOut: b.minimumAmountOut, computeUnitLimit: 250_000, computeUnitPriceMicroLamports: 1_000_000 }),
+      payer: b.address, blockhash: BLOCKHASH, keypair: b.keypair,
+    });
+    b.signature = b.presigned.signature;
+  }
   sniper.state = STATE.ARMED;
   sniper.start();
   socket.emit('open', {});
@@ -307,8 +310,8 @@ const accountNotification = (data, slot = 100) => ({
 
   assert.deepEqual(events.map(([e]) => e), ['trigger', 'firing', 'dry-run']);
   assert.equal(events[0][1].via, 'programNotification');
-  assert.equal(events[1][1].signature, sniper.presigned.signature);
-  assert.equal(events[1][1].amountIn, '250000000');
+  assert.equal(events[1][1].signatures[0].signature, sniper.buyers[0].signature);
+  assert.equal(events[1][1].totalAmountIn, '250000000');
   ok('a pool notification fires the pre-signed transaction');
 }
 {
@@ -335,7 +338,7 @@ const accountNotification = (data, slot = 100) => ({
   assert.equal(firings, 0);
   assert.equal(refusals.length, 1);
   assert.equal(refusals[0].reason, REFUSE.MINT_MISMATCH);
-  assert.equal(sniper.state, STATE.ABANDONED);
+  assert.equal(sniper.state, STATE.SETTLED);
   ok('a mismatched pool refuses instead of firing');
 }
 {
@@ -372,9 +375,9 @@ const accountNotification = (data, slot = 100) => ({
   assert.deepEqual(events.map(([e]) => e), ['replanned', 'firing']);
   assert.equal(events[0][1].actualPool, realPool.toBase58());
   // And it must now be aimed at the REAL pool, not the one it armed against.
-  assert.equal(sniper.plan.pool.toBase58(), realPool.toBase58());
-  assert.equal(sniper.plan.config.toBase58(), otherConfig.toBase58());
-  assert.equal(sniper.plan.baseMint.toBase58(), MINT.toBase58());
+  assert.equal(sniper.buyers[0].plan.pool.toBase58(), realPool.toBase58());
+  assert.equal(sniper.buyers[0].plan.config.toBase58(), otherConfig.toBase58());
+  assert.equal(sniper.buyers[0].plan.baseMint.toBase58(), MINT.toBase58());
   ok('a config that was never going to be right re-plans and fires, instead of refusing');
 }
 {
@@ -394,7 +397,7 @@ const accountNotification = (data, slot = 100) => ({
 
   assert.deepEqual(events.map(([e]) => e), ['refused']);
   assert.equal(events[0][1].reason, REFUSE.MINT_MISMATCH);
-  assert.equal(sniper.state, STATE.ABANDONED);
+  assert.equal(sniper.state, STATE.SETTLED);
   ok('re-planning never extends to a pool for a different mint');
 }
 {
@@ -428,6 +431,194 @@ const accountNotification = (data, slot = 100) => ({
   assert.equal(warnings[0].at, 'subscribe');
   sniper.stop();
   ok('a refused subscription is reported, not swallowed');
+}
+
+// ---------------------------------------------------------------------------
+console.log('\nseveral wallets, one launch');
+
+const KP = (n) => Keypair.fromSeed(Uint8Array.from({ length: 32 }, (_, i) => (i + n) % 251));
+
+function multiSniper(sizes, over = {}) {
+  let socket;
+  const sniper = new DbcSniper({
+    wsUrl: 'ws://offline', httpUrl: 'http://offline',
+    mint: MINT, quoteMint: WSOL_MINT, config: null,
+    buyers: sizes.map((amountIn, i) => ({
+      keypair: KP(50 + i), amountIn, minimumAmountOut: 0n, label: `w${i + 1}`,
+    })),
+    dryRun: true,
+    wsFactory: () => { socket = new FakeSocket(); return socket; },
+    ...over,
+  });
+  sniper.quoteTokenProgram = TOKEN_PROGRAM;
+  sniper.baseTokenProgram = TOKEN_PROGRAM;
+  sniper.blockhashes.current = { blockhash: BLOCKHASH, lastValidBlockHeight: 1, at: Date.now() };
+  sniper.state = STATE.ARMED;
+  sniper.start();
+  socket.emit('open', {});
+  return { sniper, socket: () => socket };
+}
+
+{
+  const sizes = [50_000_000n, 80_000_000n, 30_000_000n, 120_000_000n, 20_000_000n];
+  const { sniper, socket } = multiSniper(sizes);
+  const firings = [];
+  sniper.on('firing', (d) => firings.push(d));
+
+  const realPool = derivePoolAddress(key(60), MINT, WSOL_MINT);
+  socket().message(programNotification(poolBlob({ config: key(60), pool: realPool }), realPool.toBase58()));
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(firings.length, 1);
+  assert.equal(firings[0].wallets, 5);
+  assert.equal(firings[0].totalAmountIn, '300000000');
+  // Different sizes, because equal amounts across wallets is itself a pattern.
+  assert.deepEqual(firings[0].signatures.map((s) => s.amountIn), sizes.map(String));
+  ok('five wallets with different sizes all fire on one trigger');
+}
+{
+  // Every wallet must sign its OWN transaction. One signature reused would mean
+  // one buy pretending to be five, and four of them failing on chain.
+  const { sniper, socket } = multiSniper([10_000_000n, 20_000_000n, 30_000_000n]);
+  const firings = [];
+  sniper.on('firing', (d) => firings.push(d));
+  const realPool = derivePoolAddress(key(61), MINT, WSOL_MINT);
+  socket().message(programNotification(poolBlob({ config: key(61), pool: realPool }), realPool.toBase58()));
+  await new Promise((r) => setImmediate(r));
+
+  const sigs = firings[0].signatures.map((s) => s.signature);
+  assert.equal(new Set(sigs).size, 3, 'three distinct signatures');
+  // And each is payable by its own wallet, not by the first.
+  const payers = sniper.buyers.map((b) => b.address.toBase58());
+  assert.equal(new Set(payers).size, 3);
+  for (const b of sniper.buyers) {
+    const tx = VersionedTransaction.deserialize(Buffer.from(b.presigned.base64, 'base64'));
+    assert.equal(tx.message.staticAccountKeys[0].toBase58(), b.address.toBase58(), `${b.label} pays for its own transaction`);
+    assert.notEqual(bs58.encode(tx.signatures[0]), bs58.encode(new Uint8Array(64)), `${b.label} is signed`);
+  }
+  ok('each wallet signs and pays for its own transaction');
+}
+{
+  // The pool, config and both vaults are identical for every wallet — only the
+  // token accounts differ. Deriving them per wallet would be wasted hot-path work.
+  const { sniper, socket } = multiSniper([10_000_000n, 20_000_000n, 30_000_000n]);
+  const realPool = derivePoolAddress(key(62), MINT, WSOL_MINT);
+  socket().message(programNotification(poolBlob({ config: key(62), pool: realPool }), realPool.toBase58()));
+  await new Promise((r) => setImmediate(r));
+
+  const pools = new Set(sniper.buyers.map((b) => b.plan.pool.toBase58()));
+  const baseVaults = new Set(sniper.buyers.map((b) => b.plan.baseVault.toBase58()));
+  const outputs = new Set(sniper.buyers.map((b) => b.plan.outputTokenAccount.toBase58()));
+  assert.equal(pools.size, 1, 'one pool');
+  assert.equal(baseVaults.size, 1, 'one base vault');
+  assert.equal(outputs.size, 3, 'a separate output account per wallet');
+  ok('wallets share the pool and its vaults, and never share a token account');
+}
+{
+  // A wallet listed twice is two transactions spending one wrapped balance; the
+  // second fails on chain having paid a fee.
+  assert.throws(() => new DbcSniper({
+    wsUrl: 'ws://o', httpUrl: 'http://o', mint: MINT, quoteMint: WSOL_MINT,
+    buyers: [
+      { keypair: KP(70), amountIn: 1n, minimumAmountOut: 0n },
+      { keypair: KP(70), amountIn: 2n, minimumAmountOut: 0n },
+    ],
+  }), /appears more than once/);
+  ok('the same wallet listed twice is refused');
+}
+{
+  assert.throws(() => new DbcSniper({ wsUrl: 'ws://o', httpUrl: 'http://o', mint: MINT, quoteMint: WSOL_MINT, buyers: [] }), /no buyers/);
+  assert.throws(() => new DbcSniper({
+    wsUrl: 'ws://o', httpUrl: 'http://o', mint: MINT, quoteMint: WSOL_MINT,
+    buyers: [{ keypair: KP(71), amountIn: 0n, minimumAmountOut: 0n }],
+  }), /amountIn must be a positive bigint/);
+  assert.throws(() => new DbcSniper({
+    wsUrl: 'ws://o', httpUrl: 'http://o', mint: MINT, quoteMint: WSOL_MINT,
+    buyers: [{ keypair: KP(72), amountIn: 1n, minimumAmountOut: -1n }],
+  }), /minimumAmountOut must be a non-negative bigint/);
+  ok('an empty list, a zero size and a negative floor are all refused');
+}
+{
+  // PARTIAL OUTCOMES ARE NORMAL. Three wallets, one filling, one failing on
+  // chain and one never seen, is a real result — and reporting it as a single
+  // total would hide which wallets actually hold the token.
+  const polls = [];
+  // Keyed by SIGNATURE, not by position: a stub that answers positionally gives
+  // the second poll's single pending wallet the first wallet's answer, which is
+  // how this test passed while proving nothing the first time it was written.
+  const outcomes = new Map();
+
+  const { sniper, socket } = multiSniper([10_000_000n, 20_000_000n, 30_000_000n], {
+    dryRun: false,
+    confirmPollMs: 5,
+    fireWindowMs: 80,
+    statusFetcher: (sigs) => {
+      polls.push(sigs);
+      return Promise.resolve(sigs.map((sig) => outcomes.get(sig) ?? null));
+    },
+  });
+
+  const filled = [], failed = [], settled = [];
+  sniper.on('wallet-filled', (d) => filled.push(d));
+  sniper.on('wallet-failed', (d) => failed.push(d));
+  sniper.on('settled', (d) => settled.push(d));
+  sniper.on('sent', () => {});
+  sniper.on('send-error', () => {});
+  // Signatures only exist once the transactions are built.
+  sniper.on('firing', () => {
+    outcomes.set(sniper.buyers[0].signature, { slot: 999, err: null, confirmations: 2 });
+    outcomes.set(sniper.buyers[1].signature, { slot: 999, err: { InstructionError: [3, { Custom: 6000 }] } });
+    // w3 stays absent: the cluster never saw it.
+  });
+
+  const realPool = derivePoolAddress(key(63), MINT, WSOL_MINT);
+  socket().message(programNotification(poolBlob({ config: key(63), pool: realPool }), realPool.toBase58()));
+
+  await new Promise((r) => setTimeout(r, 200));
+  sniper.stop();
+
+  assert.equal(polls[0].length, 3, 'all three signatures are polled in one call');
+  assert.ok(polls.some((p) => p.length < 3), 'polling narrows to the unresolved wallets');
+
+  assert.equal(filled.length, 1);
+  assert.equal(filled[0].label, 'w1');
+  assert.equal(filled[0].amountIn, '10000000');
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].label, 'w2');
+  assert.deepEqual(failed[0].err, { InstructionError: [3, { Custom: 6000 }] });
+
+  assert.equal(settled.length, 1, 'settled is reported exactly once');
+  assert.equal(settled[0].filled, 1);
+  assert.equal(settled[0].failed, 1);
+  assert.equal(settled[0].missed, 1);
+  // Only what actually filled counts as spent.
+  assert.equal(settled[0].totalSpent, '10000000');
+  assert.equal(settled[0].wallets.length, 3);
+  assert.equal(settled[0].wallets.find((w) => w.label === 'w3').state, 'abandoned');
+  ok('one filled, one failed and one missed settle independently and report once');
+}
+{
+  // A wallet that failed must not keep being re-sent: the signature is spent and
+  // the resend loop would hammer a transaction that can never land.
+  let calls = 0;
+  const { sniper, socket } = multiSniper([10_000_000n], {
+    dryRun: false, confirmPollMs: 5, resendMs: 10, fireWindowMs: 120,
+    statusFetcher: (sigs) => Promise.resolve(sigs.map(() => ({ slot: 1, err: { Custom: 1 } }))),
+  });
+  sniper.on('sent', () => { calls++; });
+  sniper.on('send-error', () => { calls++; });
+  sniper.on('wallet-failed', () => {});
+  sniper.on('settled', () => {});
+
+  const realPool = derivePoolAddress(key(64), MINT, WSOL_MINT);
+  socket().message(programNotification(poolBlob({ config: key(64), pool: realPool }), realPool.toBase58()));
+  await new Promise((r) => setTimeout(r, 40));
+  const afterFailure = calls;
+  await new Promise((r) => setTimeout(r, 60));
+  sniper.stop();
+
+  assert.equal(calls, afterFailure, 'no further sends after the wallet failed');
+  ok('resending stops for a wallet once its outcome is known');
 }
 
 console.log(`\n${pass} checks passed\n`);

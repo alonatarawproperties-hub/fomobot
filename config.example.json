@@ -52,9 +52,27 @@
     "baseTokenProgram": null,
     "_quote_comment": "What you pay in. Defaults to wrapped SOL. This MUST match the config's quote mint; arming refuses if it does not.",
     "quoteMint": "So11111111111111111111111111111111111111112",
-    "_amount_comment": "Raw quote units, as a string. wSOL has 9 decimals, so 250000000 is 0.25 SOL.",
+    "_wallets_comment": "SEVERAL WALLETS, ONE LAUNCH. Each entry names the ENVIRONMENT VARIABLE holding that wallet's key -- never the key itself -- and what that wallet spends. Every wallet needs its own wrapped quote balance AND its own native SOL (token-account rent plus fees, roughly 0.0021 SOL plus the priority fee). `prepare` funds them all; `plan` reports which are short. A wallet that is short at arm time is DROPPED with a warning, not fatal: four of five is still a snipe. Delete this list to use the single key in FIRSTFILL_SOLANA_KEY with snipe.amountIn below.",
+    "wallets": [
+      {
+        "label": "w1",
+        "keyEnv": "FIRSTFILL_SOLANA_KEY",
+        "amountIn": "150000000"
+      },
+      {
+        "label": "w2",
+        "keyEnv": "FIRSTFILL_SOLANA_KEY_2",
+        "amountIn": "80000000"
+      },
+      {
+        "label": "w3",
+        "keyEnv": "FIRSTFILL_SOLANA_KEY_3",
+        "amountIn": "45000000"
+      }
+    ],
+    "_amount_comment": "Used ONLY when there is no wallets list above. Raw quote units, as a string. wSOL has 9 decimals, so 250000000 is 0.25 SOL.",
     "amountIn": "250000000",
-    "_minout_comment": "Raw base units below which the swap must fail. THERE IS NO DEFAULT and there will not be one: \"0\" means you accept any fill at any price, which on a launch is a real choice but has to be yours. Set it deliberately.",
+    "_minout_comment": "Raw base units below which the swap must fail. THERE IS NO DEFAULT and there will not be one: \"0\" means you accept any fill at any price, which on a launch is a real choice but has to be yours. Applies to every wallet unless an entry sets its own.",
     "minimumAmountOut": "0",
     "_fee_comment": "computeUnitLimit is the CU ceiling for the whole transaction; computeUnitPriceMicroLamports is what you bid per CU for block space. THE DEFAULTS BELOW HAVE NOT BEEN MEASURED against a live DBC launch - read the CU actually used from the first fill and tighten them.",
     "computeUnitLimit": 250000,
