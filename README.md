@@ -477,6 +477,114 @@ what the recorded entries are for, and it is what should decide sizing.
 
 ---
 
+## Sniping a Meteora launch
+
+A separate tool from the copy-trader above, for a different problem: a token whose
+**mint address is known before it launches**, on a Meteora Dynamic Bonding Curve.
+Nothing is being copied here. We are racing to be in the first block.
+
+```
+npm run snipe -- plan          print every address this will touch; touch nothing
+npm run snipe -- prepare       create and fund the account the buy spends from
+npm run snipe -- arm --dry     watch a real launch, build the buy, send nothing
+npm run snipe -- arm           watch, and buy the instant the pool exists
+```
+
+### Why it can be fast
+
+A DBC pool is tradeable the moment its `VirtualPool` account is written, and that
+account's address is a PDA of `(config, base mint, quote mint)`. So it is known
+while the pool is still nothing — and so is everything hanging off it:
+
+```
+pool           PDA["pool", config, bigger mint, smaller mint]
+base vault     PDA["token_vault", base mint, pool]
+quote vault    PDA["token_vault", quote mint, pool]
+our accounts   the usual associated-token-account derivation
+```
+
+Which means the entire transaction can be compiled and **signed before the token
+exists**. It is re-signed in the background whenever the blockhash rolls, so what
+remains at the moment of the launch is a socket write. The buy is 688 bytes — one
+packet, no lookup tables.
+
+Routing through Jupiter instead would repeat a mistake this repo already measured
+on the other chain: an aggregator cannot quote a pool it has not indexed, and
+indexing a new pool took **1 to 7 seconds** in the sample under "Catching a
+launch" above. The whole point is to be inside that window, so the swap goes
+straight at Meteora's program.
+
+### Two triggers, because they fail differently
+
+| trigger | needs | carries | fails when |
+|---|---|---|---|
+| `accountSubscribe` on the derived pool | the config | nothing but "it exists" | the config is unknown |
+| `programSubscribe` + memcmp on `base_mint` | nothing | the pool's whole account | the provider disables it |
+
+Whichever speaks first wins and the other is ignored for that launch — a repeat is
+dropped, so both firing does not buy twice. The `programSubscribe` filter matches
+`base_mint` at byte 136 of a 424-byte account, which means the notification itself
+delivers the config and both vaults: on that path nothing has to be fetched after
+the trigger. **A wrong offset there would not throw.** It would watch nothing,
+forever, looking exactly like a launch that had not happened yet, which is why the
+test recomputes it from Meteora's IDL rather than trusting the number.
+
+### Everything is checked against Meteora's own SDK
+
+`src/meteora/dbc.mjs` hand-rolls the swap rather than calling
+`@meteora-ag/dynamic-bonding-curve-sdk`, because the SDK's `buildSwap` fetches the
+pool and the config over RPC on every call — round trips inside the window we are
+trying to win. The SDK is still installed, as the **test oracle**: every constant
+is recomputed from its IDL, the PDAs are compared against its own derivation
+helpers over 40 mint pairs, and the finished instruction is compared byte for byte
+against one Anchor builds from the same IDL, all 15 accounts with their signer and
+writable flags.
+
+That caught a real bug on the first run: `payer` was marked writable and the IDL
+does not declare it `mut`. It would never have shown up in testing, because the
+payer is also the fee payer and ends up writable in the compiled message anyway.
+
+### What it refuses to do
+
+- **Arm without the money already in place.** The buy spends from an SPL token
+  account, so `prepare` wraps the SOL beforehand. Wrapping inside the snipe would
+  put three instructions and a rent payment in the hot path.
+- **Arm when the config quotes a different currency** than the one funded — the
+  derived pool would be a real address belonging to some other pool entirely.
+- **Fire at a pool that is not the one armed for.** The pool states its own mint,
+  config and vaults; all of them are compared before anything is sent, and a
+  mismatch refuses rather than retargeting.
+- **Pick a slippage floor.** `minimumAmountOut` has no default and will not get
+  one. `"0"` means "fill me at any price", which on a launch is a defensible
+  choice — but it has to be made out loud.
+
+### Known limits — read these before arming it
+
+- **None of this has been run against a live launch.** Every check above is
+  offline. The container this was built in cannot reach Solana RPC, `meteora.ag`
+  or `jup.ag` at all, so nothing here has touched mainnet. `plan` and `arm --dry`
+  exist to be run on the real box, against the real mint, before any money is on
+  the line.
+- **The latency is unmeasured.** The design removes work from the hot path; it
+  does not prove a number. There is no figure here comparable to the 1,344ms
+  measured for the EVM path, and there will not be until it runs on the VM.
+- **The compute budget defaults are guesses.** 250,000 CU and 1,000,000
+  micro-lamports per CU are placeholders. Read what the first fill actually used
+  and tighten both — the priority fee is paid on a failed transaction too.
+- **There is no exit.** Same as the rest of this repo: it buys and holds. Selling
+  is manual.
+- **Sniping the first block does not mean a good fill.** Being first on a bonding
+  curve means the highest price on it. That is a strategy decision this tool does
+  not make and cannot improve.
+- **`programSubscribe` is not universally available.** Some providers disable it,
+  and some refuse `processed` on it. If it is refused, the run says so and the
+  launch rests entirely on `accountSubscribe` — which needs the config. Without a
+  config and without `programSubscribe`, there is no trigger at all.
+- **One mint per process.** Arming is per-token by design; two launches means two
+  processes.
+
+---
+
 ## Files that need their test run before you change them
 
 Each has a dedicated offline regression suite. Run it before and after.
@@ -490,6 +598,8 @@ Each has a dedicated offline regression suite. Run it before and after.
 | `src/aggregator.mjs` | `node test-aggregator.mjs` |
 | `src/executor.mjs`, `src/executor-io.mjs`, the wiring in `index.mjs` | `node test-executor.mjs` |
 | `src/control.mjs`, `src/control-io.mjs`, `src/roster-edit.mjs` | `node test-control.mjs` |
+| `src/meteora/dbc.mjs` | `node test-meteora.mjs` |
+| `src/meteora/snipe.mjs`, `src/meteora/sniper.mjs`, `src/meteora/prepare.mjs` | `node test-sniper.mjs` |
 
 `npm test` runs a syntax check across every file first — two syntax errors have
 already shipped in test files that nothing was executing.
