@@ -10,13 +10,14 @@
   "scripts": {
     "start": "node index.mjs",
     "dry": "node index.mjs --dry",
-    "test": "npm run check && node test.mjs && node test-m02.mjs && node test-positions.mjs && node test-rh.mjs && node test-aggregator.mjs && node test-executor.mjs && node test-control.mjs && node test-dbc.mjs",
+    "test": "npm run check && node test.mjs && node test-m02.mjs && node test-positions.mjs && node test-rh.mjs && node test-aggregator.mjs && node test-executor.mjs && node test-control.mjs && node test-dbc.mjs && node test-sol-tx.mjs",
     "survey": "node survey.mjs 60",
-    "check": "node --check index.mjs && node --check scripts/new-wallet.mjs && node --check scripts/configure-executor.mjs && node --check survey.mjs && node --check test.mjs && node --check test-m02.mjs && node --check test-positions.mjs && node --check test-rh.mjs && node --check test-aggregator.mjs && node --check test-executor.mjs && node --check test-control.mjs && node --check src/feed.mjs && node --check src/decode.mjs && node --check src/matcher.mjs && node --check src/notify.mjs && node --check src/record.mjs && node --check src/solana.mjs && node --check src/policy.mjs && node --check src/sellability.mjs && node --check src/positions.mjs && node --check src/robinhood-trade.mjs && node --check src/chain/robinhood.mjs && node --check src/aggregator.mjs && node --check src/executor.mjs && node --check src/executor-io.mjs && node --check src/control.mjs && node --check src/roster-edit.mjs && node --check src/control-io.mjs && node --check src/base58.mjs && node --check src/meteora-dbc.mjs && node --check scripts/dbc-probe.mjs && node --check test-dbc.mjs",
+    "check": "node --check index.mjs && node --check scripts/new-wallet.mjs && node --check scripts/configure-executor.mjs && node --check survey.mjs && node --check test.mjs && node --check test-m02.mjs && node --check test-positions.mjs && node --check test-rh.mjs && node --check test-aggregator.mjs && node --check test-executor.mjs && node --check test-control.mjs && node --check src/feed.mjs && node --check src/decode.mjs && node --check src/matcher.mjs && node --check src/notify.mjs && node --check src/record.mjs && node --check src/solana.mjs && node --check src/policy.mjs && node --check src/sellability.mjs && node --check src/positions.mjs && node --check src/robinhood-trade.mjs && node --check src/chain/robinhood.mjs && node --check src/aggregator.mjs && node --check src/executor.mjs && node --check src/executor-io.mjs && node --check src/control.mjs && node --check src/roster-edit.mjs && node --check src/control-io.mjs && node --check src/base58.mjs && node --check src/meteora-dbc.mjs && node --check scripts/dbc-probe.mjs && node --check test-dbc.mjs && node --check test-sol-tx.mjs && node --check src/sol-keys.mjs && node --check src/sol-tx.mjs && node --check src/sol-programs.mjs && node --check src/sniper.mjs && node --check scripts/snipe.mjs",
     "paper": "node index.mjs --paper",
     "new-wallet": "node scripts/new-wallet.mjs",
     "configure": "node scripts/configure-executor.mjs",
-    "probe": "node scripts/dbc-probe.mjs"
+    "probe": "node scripts/dbc-probe.mjs",
+    "snipe": "node scripts/snipe.mjs"
   },
   "dependencies": {
     "ethers": "^6.13.0"

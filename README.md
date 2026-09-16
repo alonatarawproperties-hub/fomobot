@@ -624,3 +624,86 @@ as such — an earlier version reported one as a clean token with zero supply.
   whether it is possible.** The Robinhood Chain measurements above found the median
   launch down 2.8% thirty seconds in, with only 40% up at all. Nothing here
   suggests Solana is kinder.
+
+### Arming the snipe
+
+```sh
+# dry run: derives everything, builds the real transaction, signs nothing
+node scripts/snipe.mjs --config <config> --mint <mint> --sol 0.25 \
+     --accept-any-price --priority-fee 500000 --payer <address>
+
+# live
+FIRSTFILL_SOLANA_KEY=… node scripts/snipe.mjs --config <config> --mint <mint> \
+     --sol 0.25 --min-tokens 900000000 --priority-fee 500000 --duration 300 --rate 2 --arm
+```
+
+**Without `--arm` it signs nothing**, needs no key, and prints what it would send
+plus what the attempts would cost. It refuses before spending anything if the
+config is not a real `PoolConfig`, if the launch is not quoted in wSOL, if the
+wallet cannot cover a fill plus all fees — and if the pool **already exists**,
+because then the race is over and a blind snipe is just an expensive market buy.
+
+There is no default floor. `--min-tokens` or an explicit `--accept-any-price` is
+required, because on a launch with no price history a silent floor of zero means
+any fill is acceptable, dust included.
+
+The signing key is read from `FIRSTFILL_SOLANA_KEY` and nowhere else — a separate
+variable from the EVM key, so one pasted key cannot arm both chains. A 64-byte
+Solana key carries its own public half, and the loader **refuses** a key whose
+halves disagree: signing anyway would produce perfectly valid signatures for an
+address nobody is funding.
+
+### One fill, not hundreds
+
+Sending a buy hundreds of times raises the obvious way to lose everything: the
+pool appears and they *all* succeed. Solana has no per-sender nonce to prevent
+that — it dedupes by **signature**, and nothing else.
+
+Which is the lever. A signature covers the blockhash, so while the blockhash is
+unchanged every attempt is the *same* transaction with the *same* signature, and
+at most one can execute however many are sent. So this signs **once per
+blockhash** — not per attempt — and re-sends identical bytes.
+
+A blockhash lasts ~150 slots, so a refresh is needed about once a minute, and each
+refresh opens a new signature that could also fill. That is the one remaining
+window, and it is closed deliberately: the balance is re-read before every new
+generation, and `shouldRefresh` refuses to sign again while a fill is unconfirmed.
+`test-sol-tx.mjs` asserts both halves — same blockhash means an identical
+signature, a different one does not.
+
+### The transaction is built by hand, and pinned to prove it
+
+No Solana dependency, for the same reason as base58 and the PDA derivation: the
+alternative is megabytes of dependency for a few hundred bytes of serialisation, in
+a project whose point is a short auditable path from signal to signature.
+
+"Hand-rolled" is only acceptable if it is checked against something. A complete
+8-instruction snipe — compute budget, wSOL wrap, two idempotent ATAs, the `Swap2`
+buy, the close — serialises to a **693-byte message and a 758-byte wire
+transaction that are byte-identical to `@solana/web3.js` and `@solana/spl-token`,
+signature included.** Those hashes are pinned in `test-sol-tx.mjs`. Node's ed25519
+is checked against RFC 8032's test vector, public key and signature both.
+
+Two things that cost real time to find, recorded so they are not re-found:
+
+- **The PDA bump is a seed** — it goes *before* the program id, not after. The
+  wrong order yields a stable, plausible address for every input that simply is
+  not the account.
+- **web3.js breaks ties with a locale-aware compare**, not a byte compare, so
+  `dbcij…` sorts before `So11…`. Account order within a group does not affect
+  validity, but matching it exactly is what makes byte-level pinning possible.
+
+### What the snipe still does not do
+
+- **There is no exit.** Nothing here sells. A fill leaves a position this project
+  cannot close, and if the curve completes it migrates to DAMM v2 and the sell
+  needs a different program entirely. The CLI says so after a fill rather than
+  leaving it to be discovered.
+- **No transaction has been sent by this code.** The build path is verified against
+  the reference implementations byte-for-byte, and the guards are tested, but
+  nothing above has been proven by landing a real buy.
+- **The priority fee that actually wins is unknown.** `--priority-fee` is an input,
+  not a recommendation; no measurement here establishes what it takes to be
+  included in a contested creation slot.
+- **Token-2022 is assumed to be the likely case, not the certain one**, which is
+  why both variants are sent. The wrong one costs one transaction's fees.
