@@ -74,6 +74,12 @@ function loadSnipeConfig() {
   const mint = parseAddress('snipe.mint', s.mint);
   const quoteMint = s.quoteMint ? parseAddress('snipe.quoteMint', s.quoteMint) : WSOL_MINT;
   const config = s.config ? parseAddress('snipe.config', s.config) : null;
+  // Optional, and worth setting: it is the difference between zero round trips
+  // at fire time and one. Read it off an earlier launch with find-config.
+  const baseTokenProgram = s.baseTokenProgram ? parseAddress('snipe.baseTokenProgram', s.baseTokenProgram) : null;
+  if (baseTokenProgram && ![TOKEN_PROGRAM.toBase58(), TOKEN_2022_PROGRAM.toBase58()].includes(baseTokenProgram.toBase58())) {
+    die(`snipe.baseTokenProgram must be ${TOKEN_PROGRAM.toBase58()} (SPL Token) or ${TOKEN_2022_PROGRAM.toBase58()} (Token-2022)`);
+  }
 
   if (s.amountIn === undefined) die('snipe: amountIn is required — the raw quote amount to spend, as a string');
   const amountIn = amountField('amountIn', s.amountIn);
@@ -91,7 +97,7 @@ function loadSnipeConfig() {
   return {
     httpUrl, wsUrl,
     sendUrls: s.sendUrls?.length ? s.sendUrls : [httpUrl],
-    mint, quoteMint, config, amountIn, minimumAmountOut,
+    mint, quoteMint, config, baseTokenProgram, amountIn, minimumAmountOut,
     computeUnitLimit: s.computeUnitLimit ?? 250_000,
     computeUnitPriceMicroLamports: s.computeUnitPriceMicroLamports ?? 1_000_000,
     resendMs: s.resendMs ?? 400,
@@ -244,7 +250,8 @@ async function commandPrepare(cfg, keypair) {
 async function commandArm(cfg, keypair) {
   const sniper = new DbcSniper({
     wsUrl: cfg.wsUrl, httpUrl: cfg.httpUrl, sendUrls: cfg.sendUrls,
-    mint: cfg.mint, quoteMint: cfg.quoteMint, config: cfg.config, keypair,
+    mint: cfg.mint, quoteMint: cfg.quoteMint, config: cfg.config,
+    baseTokenProgram: cfg.baseTokenProgram, keypair,
     amountIn: cfg.amountIn, minimumAmountOut: cfg.minimumAmountOut,
     computeUnitLimit: cfg.computeUnitLimit,
     computeUnitPriceMicroLamports: cfg.computeUnitPriceMicroLamports,
@@ -252,7 +259,7 @@ async function commandArm(cfg, keypair) {
     dryRun: DRY,
   });
 
-  for (const event of ['info', 'armed', 'open', 'subscribed', 'trigger', 'firing', 'sent', 'dry-run']) {
+  for (const event of ['info', 'armed', 'open', 'subscribed', 'trigger', 'firing', 'sent', 'dry-run', 'replanned']) {
     sniper.on(event, (d) => log('info', event, d));
   }
   for (const event of ['warn', 'closed', 'send-error', 'refused', 'abandoned']) {

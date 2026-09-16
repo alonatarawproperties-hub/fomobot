@@ -514,6 +514,27 @@ indexing a new pool took **1 to 7 seconds** in the sample under "Catching a
 launch" above. The whole point is to be inside that window, so the swap goes
 straight at Meteora's program.
 
+### When the config cannot be known at all
+
+Some launchpads generate a **fresh config keypair per launch**, in the same bundle
+that creates the pool. Measured on bagr, 2026-09-16: `Keypair.generate()` per
+launch, with a UNIQUE index on `config_address` in their database asserting no two
+launches share one. Where that is true the pre-signed path is simply unavailable —
+not slower, unavailable — and `snipe.config` must be left `null`.
+
+Do not paste in a config read off some earlier token. The pool derived from it is
+a real address belonging to a different pool, and the snipe would be aimed at it.
+The bot detects this (the mint matches, the pool address does not), throws the
+plan away and rebuilds from the live pool rather than refusing — because refusing
+there means refusing to buy the right token at the only moment it can be bought.
+But it is wasted work mid-race, and the fix is to not arm with a stale config.
+
+What IS knowable in advance on such a launchpad, and worth setting, is everything
+that is constant across its launches: the quote mint and `baseTokenProgram`.
+`find-config` reads both off any earlier launch. With them set, the discovery path
+fetches **nothing** at fire time — the pool account arrives inside the trigger
+notification carrying its own config and both vaults.
+
 ### Two triggers, because they fail differently
 
 | trigger | needs | carries | fails when |
@@ -576,6 +597,13 @@ payer is also the fee payer and ends up writable in the compiled message anyway.
 - **Sniping the first block does not mean a good fill.** Being first on a bonding
   curve means the highest price on it. That is a strategy decision this tool does
   not make and cannot improve.
+- **The fee schedule is aimed at you, and it is not small.** A DBC config can set
+  a base fee that starts at `cliff_fee_numerator` — its highest value — and steps
+  down over time. Period 0 is the launch instant, so a first-block buyer pays the
+  maximum by construction. `find-config` prints the real schedule off any earlier
+  launch by the same launchpad, including what waiting would have saved. **Read it
+  before deciding the race is worth running**, because on some configs the
+  anti-sniper fee costs more than the latency wins.
 - **`programSubscribe` is not universally available.** Some providers disable it,
   and some refuse `processed` on it. If it is refused, the run says so and the
   launch rests entirely on `accountSubscribe` — which needs the config. Without a

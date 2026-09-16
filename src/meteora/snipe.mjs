@@ -138,6 +138,11 @@ export function signSnipe({ instructions, payer, blockhash, keypair }) {
  * told about.
  */
 export function planFromLivePool({ poolAddress, poolData, buyer, quoteMint, tokenBaseProgram, tokenQuoteProgram, deriveAta }) {
+  // Named, because the alternative is "Cannot read properties of null" arriving
+  // mid-race with no indication of which of five addresses was missing.
+  for (const [name, value] of Object.entries({ buyer, quoteMint, tokenBaseProgram, tokenQuoteProgram })) {
+    if (!(value instanceof PublicKey)) throw new Error(`planFromLivePool: ${name} is not a PublicKey (got ${value})`);
+  }
   const pool = decodeVirtualPool(poolData);
   const poolKey = new PublicKey(poolAddress);
   const baseVault = deriveTokenVault(poolKey, pool.baseMint);

@@ -46,8 +46,10 @@
   "snipe": {
     "_comment": "Meteora Dynamic Bonding Curve launch sniper, driven by `npm run snipe`. It is SEPARATE from the copy-trading bot above and does not run with it. The Solana signing key is read from FIRSTFILL_SOLANA_KEY (base58, or a solana-keygen JSON array) and a key placed in this file is a startup failure. Run `npm run snipe -- plan` first and READ THE DERIVED ADDRESSES: they are all PDAs, so a wrong config produces a real-looking pool address that has nothing to do with your token.",
     "mint": "PUT_THE_TOKEN_MINT_HERE",
-    "_config_comment": "The DBC config the launch uses. Supply it and the pool address is derived in advance and the whole transaction is pre-signed, so firing is a socket write. Leave it null and the bot still fires, but it cannot pre-sign and must build at fire time, which is slower. It is usually a constant for a given launchpad - ask whoever is launching.",
+    "_config_comment": "The DBC config this launch uses. IF you can know it in advance, the pool address is derived ahead of time and the whole transaction is pre-signed, so firing is a socket write. BUT MANY LAUNCHPADS GENERATE A FRESH CONFIG PER LAUNCH, in the same bundle that creates the pool - in that case it cannot be known, and this MUST be left null. Do not paste a config read off some earlier token: the pool derived from it will be the wrong address. The bot now detects that and rebuilds from the live pool rather than refusing, but it is still wasted work in the middle of the race.",
     "config": null,
+    "_basetokenprogram_comment": "The token program that will own the base mint. It cannot be read before the launch (the mint does not exist yet) but it CAN be known, from any earlier launch by the same launchpad - find-config prints it. Setting it removes the last RPC round trip from the hot path. Leave null and the bot fetches it mid-race, which works but costs time you are trying to save.",
+    "baseTokenProgram": null,
     "_quote_comment": "What you pay in. Defaults to wrapped SOL. This MUST match the config's quote mint; arming refuses if it does not.",
     "quoteMint": "So11111111111111111111111111111111111111112",
     "_amount_comment": "Raw quote units, as a string. wSOL has 9 decimals, so 250000000 is 0.25 SOL.",

@@ -257,6 +257,9 @@ function armedSniper(over = {}) {
     ...over,
   });
   sniper.plan = PLAN;
+  // arm() resolves this from the quote mint's account owner; there is no arm()
+  // here, so it is set the same way arm() would.
+  sniper.quoteTokenProgram = TOKEN_PROGRAM;
   sniper.blockhashes.current = { blockhash: BLOCKHASH, lastValidBlockHeight: 1, at: Date.now() };
   sniper.presigned = signSnipe({
     instructions: snipeInstructions({ plan: PLAN, amountIn: 250_000_000n, minimumAmountOut: 1n, computeUnitLimit: 250_000, computeUnitPriceMicroLamports: 1_000_000 }),
@@ -345,6 +348,76 @@ const accountNotification = (data, slot = 100) => ({
   // Losing one trigger must not lose the launch — that is why there are two.
   assert.equal(fired, true);
   ok('accountSubscribe still fires when the provider refuses programSubscribe');
+}
+{
+  // THE CASE THAT WOULD OTHERWISE LOSE THE LAUNCH.
+  //
+  // Some launchpads generate a fresh config per launch, in the same bundle that
+  // creates the pool — so any config armed in advance is guaranteed wrong, and the
+  // real pool appears at an address we never derived. Refusing there would mean
+  // refusing to buy the right token at the only moment it can be bought.
+  const { sniper, socket } = armedSniper();
+  const events = [];
+  for (const e of ['replanned', 'firing', 'refused']) sniper.on(e, (d) => events.push([e, d]));
+  sniper.baseTokenProgram = TOKEN_PROGRAM;   // as `snipe.baseTokenProgram` would set it
+
+  // Same mint, different config — so a different pool address entirely.
+  const otherConfig = key(41);
+  const realPool = derivePoolAddress(otherConfig, MINT, WSOL_MINT);
+  socket().message(programNotification(
+    poolBlob({ config: otherConfig, pool: realPool }), realPool.toBase58(),
+  ));
+  await new Promise((r) => setImmediate(r));
+
+  assert.deepEqual(events.map(([e]) => e), ['replanned', 'firing']);
+  assert.equal(events[0][1].actualPool, realPool.toBase58());
+  // And it must now be aimed at the REAL pool, not the one it armed against.
+  assert.equal(sniper.plan.pool.toBase58(), realPool.toBase58());
+  assert.equal(sniper.plan.config.toBase58(), otherConfig.toBase58());
+  assert.equal(sniper.plan.baseMint.toBase58(), MINT.toBase58());
+  ok('a config that was never going to be right re-plans and fires, instead of refusing');
+}
+{
+  // The re-plan must not become a way to buy the wrong token. A mismatched MINT
+  // is still a hard refusal, however the pool address looks.
+  const { sniper, socket } = armedSniper();
+  const events = [];
+  for (const e of ['replanned', 'firing', 'refused']) sniper.on(e, (d) => events.push([e, d]));
+  sniper.baseTokenProgram = TOKEN_PROGRAM;
+
+  const wrongMint = key(42);
+  const elsewhere = derivePoolAddress(key(43), wrongMint, WSOL_MINT);
+  socket().message(programNotification(
+    poolBlob({ config: key(43), baseMint: wrongMint, pool: elsewhere }), elsewhere.toBase58(),
+  ));
+  await new Promise((r) => setImmediate(r));
+
+  assert.deepEqual(events.map(([e]) => e), ['refused']);
+  assert.equal(events[0][1].reason, REFUSE.MINT_MISMATCH);
+  assert.equal(sniper.state, STATE.ABANDONED);
+  ok('re-planning never extends to a pool for a different mint');
+}
+{
+  // A pool quoted in something other than what we funded must still be refused
+  // on the re-plan route — it is the one thing planFromLivePool can catch.
+  const { sniper, socket } = armedSniper();
+  const errors = [];
+  let fired = false;
+  sniper.on('error', (e) => errors.push(e));
+  sniper.on('firing', () => { fired = true; });
+  sniper.baseTokenProgram = TOKEN_PROGRAM;
+
+  const otherConfig = key(44);
+  const realPool = derivePoolAddress(otherConfig, MINT, WSOL_MINT);
+  const blob = poolBlob({ config: otherConfig, pool: realPool });
+  blob.set(key(45).toBuffer(), VIRTUAL_POOL.QUOTE_VAULT);  // not our quote mint's vault
+  socket().message(programNotification(blob, realPool.toBase58()));
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(fired, false);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /wrong quote mint configured/);
+  ok('a re-planned pool quoted in another currency is caught before signing');
 }
 {
   const { sniper, socket } = armedSniper();

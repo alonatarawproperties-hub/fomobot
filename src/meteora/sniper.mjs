@@ -31,7 +31,7 @@ import {
   DBC_PROGRAM_ID, VIRTUAL_POOL, TOKEN_PROGRAM, TOKEN_2022_PROGRAM,
   planSnipe, decodePoolConfig, deriveAta, tokenProgramFor,
 } from './dbc.mjs';
-import { verifyPool, snipeInstructions, signSnipe, planFromLivePool } from './snipe.mjs';
+import { verifyPool, snipeInstructions, signSnipe, planFromLivePool, REFUSE } from './snipe.mjs';
 import { getAccount, getTokenBalance, sendRawTransaction, getSignatureStatuses, BlockhashCache } from './rpc.mjs';
 
 export const STATE = Object.freeze({
@@ -59,6 +59,11 @@ export class DbcSniper extends EventEmitter {
   constructor({
     wsUrl, httpUrl, sendUrls, mint, quoteMint, config = null, keypair,
     amountIn, minimumAmountOut,
+    // The base mint does not exist before the launch, so its token program cannot
+    // be read — but it CAN be known, from any earlier launch by the same
+    // launchpad. Supplying it is what removes the last round trip from the hot
+    // path on the discovery route.
+    baseTokenProgram = null,
     computeUnitLimit = 250_000, computeUnitPriceMicroLamports = 1_000_000,
     resendMs = 400, fireWindowMs = 30_000, confirmPollMs = 1000,
     dryRun = false,
@@ -89,7 +94,7 @@ export class DbcSniper extends EventEmitter {
     this.plan = null;          // pre-armed only
     this.presigned = null;     // pre-armed only
     this.quoteTokenProgram = null;
-    this.baseTokenProgram = null;
+    this.baseTokenProgram = baseTokenProgram;
     this.blockhashes = new BlockhashCache(httpUrl, { onError: (e) => this.emit('warn', { at: 'blockhash', message: e.message }) });
 
     this.ws = null;
@@ -181,7 +186,17 @@ export class DbcSniper extends EventEmitter {
       // Discovery path. The pool address is unknowable until it exists, so the
       // transaction cannot be pre-signed and the base token program has to be
       // read at fire time. Slower, and honest about being slower.
-      this.emit('armed', { mode: 'discovery', note: 'no config supplied: the transaction is built at fire time, which is slower' });
+      // Everything derivable without the config, derived now. What is left at
+      // fire time is: decode the notification, derive two vaults, sign, send.
+      this.emit('armed', {
+        mode: 'discovery',
+        note: 'no config supplied: the pool address is unknowable in advance, so the transaction is built at fire time',
+        baseTokenProgram: this.baseTokenProgram?.toBase58() ?? null,
+        roundTripsAtFire: this.baseTokenProgram ? 0 : 1,
+        advice: this.baseTokenProgram
+          ? 'nothing is fetched at fire time'
+          : 'set snipe.baseTokenProgram to remove the one remaining fetch from the race',
+      });
     }
 
     this.state = STATE.ARMED;
@@ -323,25 +338,59 @@ export class DbcSniper extends EventEmitter {
     let payload = this.presigned;
 
     if (this.plan) {
-      // Pre-armed: the only work here is proving the pool is the one we armed
-      // against. Two dozen byte comparisons, no network.
+      // Pre-armed: prove the pool is the one we armed against. Byte comparisons,
+      // no network.
       const check = verifyPool({ poolAddress, data, plan: this.plan });
-      if (!check.ok) {
+
+      if (!check.ok && (check.reason === REFUSE.POOL_MISMATCH || check.reason === REFUSE.CONFIG_MISMATCH)) {
+        // NOT a refusal, and this is the common case on some launchpads.
+        //
+        // A pool at an address we did not derive, under a config we did not
+        // expect, is exactly what happens when the launchpad mints a FRESH config
+        // per launch — the config is generated in the same bundle as the pool, so
+        // no config supplied in advance can be right. But the mint is right: the
+        // memcmp filter cannot match any other token, and verifyPool checks the
+        // mint before it checks anything else, so reaching here means the base
+        // mint already matched.
+        //
+        // Refusing here would mean refusing to buy the correct token at the one
+        // moment it can be bought, because a speed optimisation guessed wrong.
+        // So the plan is thrown away and rebuilt from the pool in front of us.
+        this.emit('replanned', {
+          why: check.reason,
+          armedPool: this.plan.pool.toBase58(),
+          actualPool: poolAddress,
+          note: 'the config was not the one this launch used — rebuilding from the live pool',
+        });
+        this.plan = null;
+        payload = null;
+      } else if (!check.ok) {
+        // Wrong mint, or vaults that do not derive from what we funded. These are
+        // not guesses that missed; they are the pool not being what it claims.
         this.state = STATE.ABANDONED;
         this.emit('refused', { reason: check.reason, detail: check.detail });
         return;
-      }
-      if (this.blockhashes.ageMs > 45_000) {
+      } else if (this.blockhashes.ageMs > 45_000) {
         this.emit('warn', { at: 'fire', message: `blockhash is ${this.blockhashes.ageMs}ms old, re-signing` });
         this.#resign();
         payload = this.presigned;
       }
-    } else {
-      // Discovery: the base token program is not known until now. One read, and
-      // only on this path.
-      const baseMintAccount = await getAccount(this.httpUrl, this.mint.toBase58(), { commitment: 'processed' });
-      if (!baseMintAccount) throw new Error(`fire: base mint ${this.mint.toBase58()} not readable`);
-      this.baseTokenProgram = new PublicKey(baseMintAccount.owner);
+    }
+
+    if (!this.plan) {
+      // Discovery. Everything needed is in the notification itself: the pool
+      // account carries its config and both vaults, so there is nothing to fetch —
+      // PROVIDED the base token program was resolved in advance. When it was not,
+      // one read happens here, and it is the only round trip in the hot path.
+      if (!this.baseTokenProgram) {
+        this.emit('warn', {
+          at: 'fire',
+          message: 'base token program unknown — fetching it now, which costs a round trip mid-race; set snipe.baseTokenProgram to avoid this',
+        });
+        const baseMintAccount = await getAccount(this.httpUrl, this.mint.toBase58(), { commitment: 'processed' });
+        if (!baseMintAccount) throw new Error(`fire: base mint ${this.mint.toBase58()} not readable`);
+        this.baseTokenProgram = new PublicKey(baseMintAccount.owner);
+      }
 
       const plan = planFromLivePool({
         poolAddress, poolData: data, buyer: this.buyer, quoteMint: this.quoteMint,
