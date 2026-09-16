@@ -17,6 +17,7 @@ import { getAssociatedTokenAddressSync, createAssociatedTokenAccountIdempotentIn
 import {
   DBC_PROGRAM_ID, POOL_AUTHORITY, TOKEN_PROGRAM, TOKEN_2022_PROGRAM, WSOL_MINT,
   SWAP_DISCRIMINATOR, VIRTUAL_POOL_DISCRIMINATOR, VIRTUAL_POOL, POOL_CONFIG,
+  decodeBaseFee, feePercent, FEE_DENOMINATOR, BASE_FEE_MODE,
   tokenProgramFor, deriveEventAuthority, derivePoolAddress, deriveTokenVault, deriveAta,
   isVirtualPool, decodeVirtualPool, decodePoolConfig,
   buildSwapInstruction, buildCreateAtaIdempotentInstruction, planSnipe,
@@ -108,7 +109,28 @@ console.log('\nconstants, recomputed from the shipped IDL');
   assert.equal(cfg.fields.get('token_decimal'), POOL_CONFIG.TOKEN_DECIMAL);
   assert.equal(cfg.fields.get('token_type'), POOL_CONFIG.TOKEN_TYPE);
   assert.equal(cfg.fields.get('quote_token_flag'), POOL_CONFIG.QUOTE_TOKEN_FLAG);
+  assert.equal(cfg.fields.get('collect_fee_mode'), POOL_CONFIG.COLLECT_FEE_MODE);
+  assert.equal(cfg.fields.get('enable_first_swap_with_min_fee'), POOL_CONFIG.ENABLE_FIRST_SWAP_WITH_MIN_FEE);
   ok('every PoolConfig offset recomputes from the IDL');
+
+  // The fee fields are NESTED inside pool_fees.base_fee, so their offsets cannot
+  // be read off PoolConfig's own field list — they have to be walked into. An
+  // error here would misreport what a snipe costs, which is a decision input.
+  let feeBase = 8;
+  for (const f of byName.get('PoolConfig').fields) {
+    if (f.name === 'pool_fees') break;
+    feeBase += size(f.type);
+  }
+  const baseFee = byName.get('BaseFeeConfig');
+  let o = feeBase; // pool_fees.base_fee is the first member of PoolFeesConfig
+  const feeOffsets = new Map();
+  for (const f of baseFee.fields) { feeOffsets.set(f.name, o); o += size(f.type); }
+  assert.equal(feeOffsets.get('cliff_fee_numerator'), POOL_CONFIG.CLIFF_FEE_NUMERATOR);
+  assert.equal(feeOffsets.get('second_factor'), POOL_CONFIG.PERIOD_FREQUENCY);
+  assert.equal(feeOffsets.get('third_factor'), POOL_CONFIG.REDUCTION_FACTOR);
+  assert.equal(feeOffsets.get('first_factor'), POOL_CONFIG.NUMBER_OF_PERIOD);
+  assert.equal(feeOffsets.get('base_fee_mode'), POOL_CONFIG.BASE_FEE_MODE);
+  ok('the nested base-fee offsets recompute from the IDL too');
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +254,83 @@ const virtualPoolBlob = ({ config = CONFIG, baseMint = BASE_MINT, baseVault = ke
   assert.equal(got.activationType, 1);
   assert.throws(() => decodePoolConfig(Buffer.alloc(100)), /expected 1048/);
   ok('a PoolConfig round-trips, and a short buffer is refused');
+}
+
+// ---------------------------------------------------------------------------
+// The fee schedule — what a first-block buy actually costs.
+// ---------------------------------------------------------------------------
+console.log('\nthe anti-sniper fee schedule');
+
+const feeBlob = ({ cliff, periodFrequency, reductionFactor, periods, mode }) => {
+  const b = Buffer.alloc(POOL_CONFIG.SIZE);
+  b.writeBigUInt64LE(cliff, POOL_CONFIG.CLIFF_FEE_NUMERATOR);
+  b.writeBigUInt64LE(periodFrequency, POOL_CONFIG.PERIOD_FREQUENCY);
+  b.writeBigUInt64LE(reductionFactor, POOL_CONFIG.REDUCTION_FACTOR);
+  b.writeUInt16LE(periods, POOL_CONFIG.NUMBER_OF_PERIOD);
+  b[POOL_CONFIG.BASE_FEE_MODE] = mode;
+  return b;
+};
+
+{
+  // Linear: 50% at the cliff, 1 point off per period, 45 periods -> 5%.
+  const f = decodeBaseFee(feeBlob({
+    cliff: 500_000_000n, periodFrequency: 1n, reductionFactor: 10_000_000n,
+    periods: 45, mode: BASE_FEE_MODE.FEE_SCHEDULER_LINEAR,
+  }));
+  assert.equal(f.modeName, 'fee-scheduler-linear');
+  // Period 0 IS the launch instant. A sniper pays the cliff by construction —
+  // this is the single number that decides whether the snipe is worth making.
+  assert.equal(f.firstBuyFeeNumerator, 500_000_000n);
+  assert.equal(feePercent(f.firstBuyFeeNumerator), 50);
+  assert.equal(feePercent(f.feeAtPeriod(10)), 40);
+  assert.equal(feePercent(f.finalFeeNumerator), 5);
+  // Past the last period it must not keep falling, or we would understate the
+  // floor for anyone arriving late.
+  assert.equal(f.feeAtPeriod(10_000), f.finalFeeNumerator);
+  ok('a linear schedule charges the cliff at period 0 and floors at the last period');
+}
+{
+  const f = decodeBaseFee(feeBlob({
+    cliff: 990_000_000n, periodFrequency: 1n, reductionFactor: 5_000n,
+    periods: 100, mode: BASE_FEE_MODE.FEE_SCHEDULER_EXPONENTIAL,
+  }));
+  assert.equal(f.modeName, 'fee-scheduler-exponential');
+  assert.equal(f.firstBuyFeeNumerator, 990_000_000n);
+  assert.ok(f.finalFeeNumerator < f.firstBuyFeeNumerator, 'an exponential schedule must decay');
+  // Monotonic: every later period is cheaper than, or equal to, the one before.
+  let prev = f.feeAtPeriod(0);
+  for (let p = 1; p <= 100; p++) { const now = f.feeAtPeriod(p); assert.ok(now <= prev, `period ${p} rose`); prev = now; }
+  ok('an exponential schedule starts at the cliff and decays monotonically');
+}
+{
+  // periodFrequency 0 means there is no schedule at all — the fee is flat, and
+  // reporting a decay that does not exist would be worse than reporting none.
+  const f = decodeBaseFee(feeBlob({
+    cliff: 30_000_000n, periodFrequency: 0n, reductionFactor: 1n,
+    periods: 10, mode: BASE_FEE_MODE.FEE_SCHEDULER_LINEAR,
+  }));
+  assert.equal(f.scheduled, false);
+  assert.equal(f.firstBuyFeeNumerator, 30_000_000n);
+  assert.equal(f.finalFeeNumerator, 30_000_000n);
+  assert.equal(feePercent(f.firstBuyFeeNumerator), 3);
+  ok('no schedule reads as a flat fee, not a decaying one');
+}
+{
+  // A reduction big enough to go past zero must clamp, not wrap around a u64.
+  const f = decodeBaseFee(feeBlob({
+    cliff: 100_000_000n, periodFrequency: 1n, reductionFactor: 90_000_000n,
+    periods: 50, mode: BASE_FEE_MODE.FEE_SCHEDULER_LINEAR,
+  }));
+  assert.equal(f.finalFeeNumerator, 0n);
+  assert.ok(f.feeAtPeriod(49) >= 0n);
+  ok('an over-large reduction clamps at zero instead of underflowing');
+}
+{
+  assert.equal(feePercent(FEE_DENOMINATOR), 100);
+  assert.equal(feePercent(0n), 0);
+  assert.equal(feePercent(990_000_000n), 99);
+  assert.equal(feePercent(25_000_000n), 2.5);
+  ok('fee numerators read out as percentages over a 1e9 denominator');
 }
 
 // ---------------------------------------------------------------------------

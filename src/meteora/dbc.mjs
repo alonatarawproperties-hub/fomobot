@@ -68,6 +68,26 @@ export const POOL_CONFIG = Object.freeze({
   TOKEN_DECIMAL: 235,
   TOKEN_TYPE: 237,        // base mint's token program: 0 = SPL Token, 1 = Token-2022
   QUOTE_TOKEN_FLAG: 238,  // same enum, for the quote mint
+  // The base fee schedule — the anti-sniper machinery. See decodeBaseFee below.
+  CLIFF_FEE_NUMERATOR: 104,
+  PERIOD_FREQUENCY: 112,   // second_factor
+  REDUCTION_FACTOR: 120,   // third_factor
+  NUMBER_OF_PERIOD: 128,   // first_factor, u16
+  BASE_FEE_MODE: 130,
+  COLLECT_FEE_MODE: 232,
+  ENABLE_FIRST_SWAP_WITH_MIN_FEE: 365,
+});
+
+/** Fees are numerators over 1e9. A 50% fee is 500_000_000. */
+export const FEE_DENOMINATOR = 1_000_000_000n;
+
+/** The program refuses anything above this: 99%. */
+export const MAX_FEE_NUMERATOR = 990_000_000n;
+
+export const BASE_FEE_MODE = Object.freeze({
+  FEE_SCHEDULER_LINEAR: 0,
+  FEE_SCHEDULER_EXPONENTIAL: 1,
+  RATE_LIMITER: 2,
 });
 
 /** TokenType in the SDK: 0 = SPLToken, 1 = Token2022. */
@@ -159,6 +179,58 @@ export function decodePoolConfig(data) {
     quoteTokenFlag: data[POOL_CONFIG.QUOTE_TOKEN_FLAG],
   };
 }
+
+/**
+ * The base fee schedule, and what it charges a buyer arriving at a given moment.
+ *
+ * THIS IS THE ANTI-SNIPER MECHANISM, AND IT IS AIMED AT US. The fee starts at
+ * `cliffFeeNumerator` — the HIGHEST it will ever be — and steps down every
+ * `periodFrequency` for `numberOfPeriod` steps. Period 0 is the launch instant.
+ * So a buyer in the first block pays the cliff by construction, and waiting is
+ * what makes it cheaper.
+ *
+ * Mirrors getBaseFeeNumeratorByPeriod in the SDK. Linear subtracts
+ * reductionFactor per period; exponential multiplies by (1 - reductionFactor/1e4)
+ * per period, which the SDK does in Q64 fixed point and this approximates in
+ * floating point — close enough to READ a schedule, never used to size a trade.
+ */
+export function decodeBaseFee(data) {
+  const cliff = data.readBigUInt64LE(POOL_CONFIG.CLIFF_FEE_NUMERATOR);
+  const periodFrequency = data.readBigUInt64LE(POOL_CONFIG.PERIOD_FREQUENCY);
+  const reductionFactor = data.readBigUInt64LE(POOL_CONFIG.REDUCTION_FACTOR);
+  const numberOfPeriod = data.readUInt16LE(POOL_CONFIG.NUMBER_OF_PERIOD);
+  const mode = data[POOL_CONFIG.BASE_FEE_MODE];
+
+  const at = (period) => {
+    const p = BigInt(Math.min(period, numberOfPeriod));
+    if (periodFrequency === 0n) return cliff;           // no schedule: flat forever
+    if (mode === BASE_FEE_MODE.FEE_SCHEDULER_LINEAR) {
+      const reduction = p * reductionFactor;
+      return reduction >= cliff ? 0n : cliff - reduction;
+    }
+    if (mode === BASE_FEE_MODE.FEE_SCHEDULER_EXPONENTIAL) {
+      const factor = (1 - Number(reductionFactor) / 10_000) ** Number(p);
+      return BigInt(Math.round(Number(cliff) * factor));
+    }
+    return cliff; // rate limiter: not a time schedule, so the cliff is the honest answer
+  };
+
+  return {
+    mode,
+    modeName: ['fee-scheduler-linear', 'fee-scheduler-exponential', 'rate-limiter'][mode] ?? `unknown(${mode})`,
+    cliffFeeNumerator: cliff,
+    periodFrequency,
+    reductionFactor,
+    numberOfPeriod,
+    feeAtPeriod: at,
+    firstBuyFeeNumerator: at(0),
+    finalFeeNumerator: at(numberOfPeriod),
+    scheduled: periodFrequency !== 0n && numberOfPeriod > 0,
+  };
+}
+
+/** A fee numerator as a percentage, for reading aloud. */
+export const feePercent = (numerator) => Number(numerator * 10_000n / FEE_DENOMINATOR) / 100;
 
 /**
  * The swap instruction — `swap`, the one the IDL labels "TRADING BOTS FUNCTIONS".

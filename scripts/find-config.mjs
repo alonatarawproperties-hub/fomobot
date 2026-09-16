@@ -21,7 +21,8 @@ import { readFileSync } from 'node:fs';
 import { PublicKey } from '@solana/web3.js';
 import {
   DBC_PROGRAM_ID, VIRTUAL_POOL, POOL_CONFIG,
-  decodeVirtualPool, decodePoolConfig, tokenProgramFor, derivePoolAddress,
+  decodeVirtualPool, decodePoolConfig, decodeBaseFee, feePercent,
+  tokenProgramFor, derivePoolAddress,
 } from '../src/meteora/dbc.mjs';
 import { rpc, getAccount } from '../src/meteora/rpc.mjs';
 
@@ -106,6 +107,43 @@ log('info', 'config says', {
   baseTokenProgram: tokenProgramFor(cfg.tokenType).toBase58(),
   baseDecimals: cfg.tokenDecimal,
 });
+
+// WHAT THE FIRST BLOCK ACTUALLY COSTS.
+//
+// The base fee starts at the cliff — its highest value — and steps down over
+// time. Period 0 is the launch instant, so a first-block buyer pays the maximum
+// by construction. That is not a side effect; it is the anti-sniper design, and
+// it is aimed squarely at what this bot does. Read it before deciding the snipe
+// is worth making.
+const fee = decodeBaseFee(cfgAccount.data);
+const unit = cfg.activationType === 0 ? 'slots' : 'seconds';
+
+log('signal', 'FEE SCHEDULE', {
+  mode: fee.modeName,
+  firstBuyPaysPercent: feePercent(fee.firstBuyFeeNumerator),
+  settlesAtPercent: feePercent(fee.finalFeeNumerator),
+  periods: fee.numberOfPeriod,
+  periodLength: `${fee.periodFrequency} ${unit}`,
+  fullDecayAfter: fee.scheduled ? `${fee.periodFrequency * BigInt(fee.numberOfPeriod)} ${unit}` : 'no schedule — flat',
+  enableFirstSwapWithMinFee: Boolean(cfgAccount.data[POOL_CONFIG.ENABLE_FIRST_SWAP_WITH_MIN_FEE]),
+});
+
+if (fee.scheduled) {
+  // A few points along the curve, so the trade-off is a table rather than a
+  // formula: this is what waiting buys you.
+  const marks = [0, 1, 2, 5, 10, 30, fee.numberOfPeriod].filter((v, i, a) => a.indexOf(v) === i && v <= fee.numberOfPeriod);
+  log('info', 'fee by arrival time', Object.fromEntries(marks.map((p) => [
+    `after ${fee.periodFrequency * BigInt(p)} ${unit}`, `${feePercent(fee.feeAtPeriod(p))}%`,
+  ])));
+
+  const cost = feePercent(fee.firstBuyFeeNumerator) - feePercent(fee.finalFeeNumerator);
+  if (cost > 0) {
+    log('warn', 'what being first costs you', {
+      extraFeePercentagePoints: Number(cost.toFixed(4)),
+      meaning: `buying in the first block costs ${cost.toFixed(2)} percentage points more than waiting ${fee.periodFrequency * BigInt(fee.numberOfPeriod)} ${unit}`,
+    });
+  }
+}
 
 // THE PROOF. Re-derive this pool's address from (config, mints) alone. If it
 // matches the address the cluster served, then every PDA the pre-armed snipe
