@@ -137,7 +137,7 @@ async function commandPlan(cfg, keypair) {
   log('info', 'target', {
     mint: cfg.mint.toBase58(),
     quoteMint: cfg.quoteMint.toBase58(),
-    config: cfg.config?.toBase58() ?? '(none — discovery mode, slower)',
+    config: cfg.config?.toBase58() ?? '(none — discovered from the trigger notification)',
     amountIn: cfg.amountIn.toString(),
     minimumAmountOut: cfg.minimumAmountOut.toString(),
   });
@@ -162,7 +162,27 @@ async function commandPlan(cfg, keypair) {
   });
 
   if (!cfg.config) {
-    log('warn', 'no config: the pool address cannot be derived in advance, so nothing can be pre-signed');
+    // The pool address needs the config, so it cannot be shown. But the account
+    // the tokens land in does NOT — it derives from the mint and the token
+    // program, both known now. Worth printing: it is the address to watch after a
+    // fill, and the one thing an operator can check independently.
+    if (cfg.baseTokenProgram) {
+      log('info', 'where the tokens will land', {
+        outputTokenAccount: deriveAta(buyer, cfg.mint, cfg.baseTokenProgram).toBase58(),
+        baseTokenProgram: cfg.baseTokenProgram.toBase58(),
+        roundTripsAtFire: 0,
+        note: 'created inside the snipe transaction itself — the mint does not exist yet',
+      });
+    } else {
+      log('warn', 'snipe.baseTokenProgram is not set', {
+        cost: 'one RPC round trip in the middle of the race, to learn which token program owns the mint',
+        fix: 'read it off an earlier launch with find-config and put it in config.json',
+      });
+    }
+    log('info', 'no config, which is correct when the launchpad mints one per launch', {
+      meaning: 'the pool address cannot be derived in advance, so nothing is pre-signed',
+      trigger: 'programSubscribe on the mint — the notification carries the pool, its config and both vaults',
+    });
     return;
   }
 
