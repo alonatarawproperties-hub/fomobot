@@ -32,7 +32,7 @@ import {
   planSnipe, decodePoolConfig, deriveAta, tokenProgramFor,
 } from './dbc.mjs';
 import { verifyPool, snipeInstructions, signSnipe, planFromLivePool, REFUSE } from './snipe.mjs';
-import { getAccount, getTokenBalance, sendRawTransaction, getSignatureStatuses, BlockhashCache } from './rpc.mjs';
+import { getAccount, getTokenBalance, getBalance, sendRawTransaction, getSignatureStatuses, BlockhashCache } from './rpc.mjs';
 
 export const STATE = Object.freeze({
   IDLE: 'idle',
@@ -142,6 +142,35 @@ export class DbcSniper extends EventEmitter {
       throw new Error(`arm: quote token account holds ${balance}, need ${this.amountIn}`);
     }
     this.emit('info', { at: 'arm', quoteAta: quoteAta.toBase58(), balance: balance.toString(), tokenProgram: this.quoteTokenProgram.toBase58() });
+
+    // NATIVE SOL, WHICH IS NOT THE SAME MONEY.
+    //
+    // The buy is spent from the wrapped account checked above, but the
+    // transaction itself is paid for in plain lamports — and it opens a token
+    // account for a mint that does not exist yet, so it pays rent for that too.
+    // Wrapping every last lamport leaves a wallet that is fully funded to buy and
+    // unable to send, and the way that fails is the snipe going out and being
+    // dropped for an unfunded fee payer, mid-race, with the launch not repeating.
+    const lamports = await getBalance(this.httpUrl, this.buyer.toBase58(), { commitment: 'confirmed' });
+    // Priority fee is priced per compute unit in micro-lamports, so the budget
+    // costs limit * price / 1e6 lamports if every unit is consumed.
+    const priorityFee = BigInt(this.computeUnitLimit) * BigInt(this.computeUnitPriceMicroLamports) / 1_000_000n;
+    const BASE_FEE = 5_000n;             // one signature
+    const ATA_RENT = 2_100_000n;         // rent exemption for the output token account, rounded up
+    const needed = priorityFee + BASE_FEE + ATA_RENT;
+
+    if (lamports < needed) {
+      throw new Error(
+        `arm: wallet holds ${lamports} lamports of native SOL, needs at least ${needed} `
+        + `(${ATA_RENT} rent for the token account the snipe creates, ${priorityFee} priority fee, ${BASE_FEE} base fee). `
+        + 'Send more SOL — do not unwrap, that would leave the buy short.',
+      );
+    }
+    this.emit('info', {
+      at: 'arm', nativeLamports: lamports.toString(), needed: needed.toString(),
+      breakdown: { ataRent: ATA_RENT.toString(), priorityFee: priorityFee.toString(), baseFee: BASE_FEE.toString() },
+      headroom: (lamports - needed).toString(),
+    });
 
     if (this.config) {
       const cfgAccount = await getAccount(this.httpUrl, this.config.toBase58(), { commitment: 'confirmed' });

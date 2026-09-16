@@ -35,6 +35,13 @@ export async function getTokenBalance(url, tokenAccount, opts = {}) {
   return acct.data.readBigUInt64LE(64);
 }
 
+/** Native SOL, in lamports. What actually pays the fees. */
+export async function getBalance(url, address, { commitment = 'confirmed', ...opts } = {}) {
+  const { result, error } = await rpc(url, 'getBalance', [address, { commitment }], opts);
+  if (error) throw new Error(`getBalance ${address}: ${error.message}`);
+  return BigInt(result?.value ?? 0);
+}
+
 export async function getLatestBlockhash(url, { commitment = 'confirmed', ...opts } = {}) {
   const { result, error } = await rpc(url, 'getLatestBlockhash', [{ commitment }], opts);
   if (error) throw new Error(`getLatestBlockhash: ${error.message}`);
