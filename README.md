@@ -583,6 +583,18 @@ Every wallet needs its own native SOL, not just its own wrapped balance: the
 token-account rent and the fee come out of plain lamports, about 0.0021 SOL plus
 the priority fee, per wallet.
 
+**Bidding, and why order is not random.** Wallets racing one launch all write the
+same pool account, so Solana cannot execute them in parallel — the block takes
+them in fee order. `computeUnitPriceMicroLamports` on a wallet overrides the
+global bid, which is how you decide which of your own wallets fills first when
+not all of them fit in the first block. Each wallet's native-SOL requirement
+follows its own bid, and `plan` prices every wallet separately rather than
+quoting one figure.
+
+The aggregate is barely affected by the internal order — the curve gets walked
+the same distance either way — so this matters when the block is contested and
+some of your wallets may not make it, not when all of them land.
+
 **What splitting does not do.** If the aim is to not read as one buyer, the bot
 cannot deliver that by itself. Five wallets buying one token in one block is
 itself a pattern, and funding them from one source links them in a single hop on

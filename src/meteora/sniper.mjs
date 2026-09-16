@@ -103,6 +103,15 @@ export class DbcSniper extends EventEmitter {
       if (!b.keypair) throw new Error(`buyer ${i}: no keypair`);
       if (typeof b.amountIn !== 'bigint' || b.amountIn <= 0n) throw new Error(`buyer ${i}: amountIn must be a positive bigint`);
       if (typeof b.minimumAmountOut !== 'bigint' || b.minimumAmountOut < 0n) throw new Error(`buyer ${i}: minimumAmountOut must be a non-negative bigint`);
+      // A wallet may bid its own priority fee. When several wallets race for one
+      // launch they all write the same pool account, so they cannot execute in
+      // parallel — the block fits them in fee order. Laddering the bids is how an
+      // operator decides WHICH of their own wallets gets in first when not all of
+      // them fit, rather than leaving it to chance.
+      const price = b.computeUnitPriceMicroLamports ?? computeUnitPriceMicroLamports;
+      const limit = b.computeUnitLimit ?? computeUnitLimit;
+      if (!Number.isInteger(price) || price < 0) throw new Error(`buyer ${i}: computeUnitPriceMicroLamports must be a non-negative integer`);
+      if (!Number.isInteger(limit) || limit <= 0) throw new Error(`buyer ${i}: computeUnitLimit must be a positive integer`);
       return {
         index: i,
         label: b.label ?? `w${i + 1}`,
@@ -110,6 +119,9 @@ export class DbcSniper extends EventEmitter {
         address: b.keypair.publicKey,
         amountIn: b.amountIn,
         minimumAmountOut: b.minimumAmountOut,
+        computeUnitLimit: limit,
+        computeUnitPriceMicroLamports: price,
+        priorityFeeLamports: BigInt(limit) * BigInt(price) / 1_000_000n,
         plan: null,
         presigned: null,
         signature: null,
@@ -158,14 +170,9 @@ export class DbcSniper extends EventEmitter {
     this.timeline = {};
   }
 
-  /** The priority fee this budget costs if every unit is consumed. */
-  get priorityFeeLamports() {
-    return BigInt(this.computeUnitLimit) * BigInt(this.computeUnitPriceMicroLamports) / 1_000_000n;
-  }
-
-  /** What one wallet needs in plain SOL, beyond its wrapped balance. */
-  get perWalletLamportsNeeded() {
-    return this.priorityFeeLamports + BASE_FEE_LAMPORTS + ATA_RENT_LAMPORTS;
+  /** What THIS wallet needs in plain SOL, beyond its wrapped balance. */
+  lamportsNeededFor(buyer) {
+    return buyer.priorityFeeLamports + BASE_FEE_LAMPORTS + ATA_RENT_LAMPORTS;
   }
 
   #mark(name) { this.timeline[name] = Date.now(); this.emit('mark', { name, at: this.timeline[name] }); }
@@ -209,7 +216,6 @@ export class DbcSniper extends EventEmitter {
       this.baseTokenProgram = tokenProgramFor(poolConfig.tokenType);
     }
 
-    const needed = this.perWalletLamportsNeeded;
     const usable = [];
 
     for (const b of this.buyers) {
@@ -224,7 +230,8 @@ export class DbcSniper extends EventEmitter {
       const problems = [];
       if (wrapped === null) problems.push(`quote token account ${quoteAta.toBase58()} does not exist — run prepare`);
       else if (wrapped < b.amountIn) problems.push(`quote account holds ${wrapped}, needs ${b.amountIn}`);
-      if (lamports < needed) problems.push(`holds ${lamports} lamports of native SOL, needs ${needed} (${ATA_RENT_LAMPORTS} rent + ${this.priorityFeeLamports} priority + ${BASE_FEE_LAMPORTS} base fee)`);
+      const needed = this.lamportsNeededFor(b);
+      if (lamports < needed) problems.push(`holds ${lamports} lamports of native SOL, needs ${needed} (${ATA_RENT_LAMPORTS} rent + ${b.priorityFeeLamports} priority + ${BASE_FEE_LAMPORTS} base fee)`);
 
       if (problems.length) {
         b.state = BUYER_STATE.ABANDONED;
@@ -241,7 +248,8 @@ export class DbcSniper extends EventEmitter {
         quoteAta: quoteAta.toBase58(),
         wrapped: wrapped.toString(),
         nativeLamports: lamports.toString(),
-        headroom: (lamports - needed).toString(),
+        priorityFee: b.priorityFeeLamports.toString(),
+        headroom: (lamports - this.lamportsNeededFor(b)).toString(),
       });
 
       if (this.config && poolConfig) {
@@ -316,8 +324,10 @@ export class DbcSniper extends EventEmitter {
       signSnipe({
         instructions: snipeInstructions({
           plan: throwaway, amountIn: 1n, minimumAmountOut: 0n,
-          computeUnitLimit: this.computeUnitLimit,
-          computeUnitPriceMicroLamports: this.computeUnitPriceMicroLamports,
+          // The buyer's own budget, so the warm-up compiles the same shape the
+          // real transaction will take.
+          computeUnitLimit: b.computeUnitLimit,
+          computeUnitPriceMicroLamports: b.computeUnitPriceMicroLamports,
         }),
         payer: b.address, blockhash: this.blockhashes.blockhash, keypair: b.keypair,
       });
@@ -334,8 +344,8 @@ export class DbcSniper extends EventEmitter {
       b.presigned = signSnipe({
         instructions: snipeInstructions({
           plan: b.plan, amountIn: b.amountIn, minimumAmountOut: b.minimumAmountOut,
-          computeUnitLimit: this.computeUnitLimit,
-          computeUnitPriceMicroLamports: this.computeUnitPriceMicroLamports,
+          computeUnitLimit: b.computeUnitLimit,
+          computeUnitPriceMicroLamports: b.computeUnitPriceMicroLamports,
         }),
         payer: b.address, blockhash: this.blockhashes.blockhash, keypair: b.keypair,
       });
@@ -506,8 +516,8 @@ export class DbcSniper extends EventEmitter {
         b.presigned = signSnipe({
           instructions: snipeInstructions({
             plan: b.plan, amountIn: b.amountIn, minimumAmountOut: b.minimumAmountOut,
-            computeUnitLimit: this.computeUnitLimit,
-            computeUnitPriceMicroLamports: this.computeUnitPriceMicroLamports,
+            computeUnitLimit: b.computeUnitLimit,
+            computeUnitPriceMicroLamports: b.computeUnitPriceMicroLamports,
           }),
           payer: b.address, blockhash: this.blockhashes.blockhash, keypair: b.keypair,
         });
@@ -525,7 +535,11 @@ export class DbcSniper extends EventEmitter {
       totalAmountIn: live.reduce((s, b) => s + b.amountIn, 0n).toString(),
       triggerToBuildMs: this.timeline.built - this.timeline.trigger,
       dryRun: this.dryRun,
-      signatures: live.map((b) => ({ label: b.label, signature: b.signature, amountIn: b.amountIn.toString() })),
+      totalPriorityFee: live.reduce((s, b) => s + b.priorityFeeLamports, 0n).toString(),
+      // Highest bidder first: the order the block is expected to take them in.
+      signatures: [...live]
+        .sort((a, b) => (b.priorityFeeLamports > a.priorityFeeLamports ? 1 : b.priorityFeeLamports < a.priorityFeeLamports ? -1 : 0))
+        .map((b) => ({ label: b.label, signature: b.signature, amountIn: b.amountIn.toString(), priorityFee: b.priorityFeeLamports.toString() })),
     });
 
     if (this.dryRun) {

@@ -107,7 +107,23 @@ function loadSnipeConfig() {
         ? defaultMinOut
         : amountField(`${where}.minimumAmountOut`, w.minimumAmountOut);
       if (minimumAmountOut < 0n) die(`${where}: minimumAmountOut cannot be negative`);
-      return { keyEnv, amountIn, minimumAmountOut, label: w.label ?? `w${i + 1}` };
+      // A wallet may outbid the others. When several wallets race one launch they
+      // all write the same pool account and cannot execute in parallel, so the
+      // block takes them in fee order — laddering decides which of YOUR wallets
+      // gets in first if not all of them fit.
+      const priceOverride = w.computeUnitPriceMicroLamports;
+      if (priceOverride !== undefined && (!Number.isInteger(priceOverride) || priceOverride < 0)) {
+        die(`${where}.computeUnitPriceMicroLamports must be a non-negative integer`);
+      }
+      const limitOverride = w.computeUnitLimit;
+      if (limitOverride !== undefined && (!Number.isInteger(limitOverride) || limitOverride <= 0)) {
+        die(`${where}.computeUnitLimit must be a positive integer`);
+      }
+      return {
+        keyEnv, amountIn, minimumAmountOut, label: w.label ?? `w${i + 1}`,
+        computeUnitPriceMicroLamports: priceOverride,
+        computeUnitLimit: limitOverride,
+      };
     });
 
     const envs = wallets.map((w) => w.keyEnv);
@@ -189,11 +205,16 @@ async function commandPlan(cfg, wallets) {
   if (!quoteMintAccount) die(`quote mint ${cfg.quoteMint.toBase58()} does not exist`);
   const quoteTokenProgram = new PublicKey(quoteMintAccount.owner);
 
-  // What one wallet needs in plain SOL on top of its wrapped balance.
-  const priorityFee = BigInt(cfg.computeUnitLimit) * BigInt(cfg.computeUnitPriceMicroLamports) / 1_000_000n;
-  const needNative = priorityFee + 5_000n + 2_100_000n;
+  // Each wallet is priced on ITS OWN budget — a laddered bid changes what that
+  // wallet must hold, and a single figure would understate the top of the ladder.
+  const needFor = (w) => {
+    const limit = BigInt(w.computeUnitLimit ?? cfg.computeUnitLimit);
+    const price = BigInt(w.computeUnitPriceMicroLamports ?? cfg.computeUnitPriceMicroLamports);
+    return { priorityFee: limit * price / 1_000_000n, need: limit * price / 1_000_000n + 5_000n + 2_100_000n };
+  };
 
   let ready = 0;
+  let totalPriority = 0n;
   for (const w of wallets) {
     const address = w.keypair.publicKey;
     const quoteAta = deriveAta(address, cfg.quoteMint, quoteTokenProgram);
@@ -201,6 +222,8 @@ async function commandPlan(cfg, wallets) {
       getTokenBalance(cfg.httpUrl, quoteAta.toBase58(), { commitment: 'confirmed' }),
       getBalance(cfg.httpUrl, address.toBase58(), { commitment: 'confirmed' }),
     ]);
+    const { priorityFee, need: needNative } = needFor(w);
+    totalPriority += priorityFee;
     const wrappedOk = wrapped !== null && wrapped >= w.amountIn;
     const nativeOk = lamports >= needNative;
     if (wrappedOk && nativeOk) ready++;
@@ -215,13 +238,17 @@ async function commandPlan(cfg, wallets) {
       wrappedEnough: wrappedOk,
       nativeLamports: lamports.toString(),
       nativeEnough: nativeOk,
+      priorityFee: priorityFee.toString(),
+      needNative: needNative.toString(),
       shortfallNative: nativeOk ? '0' : (needNative - lamports).toString(),
       receivesInto: cfg.baseTokenProgram ? deriveAta(address, cfg.mint, cfg.baseTokenProgram).toBase58() : '(set snipe.baseTokenProgram to show)',
     });
   }
 
   log(ready === wallets.length ? 'info' : 'warn', 'wallets ready', {
-    ready, of: wallets.length, needNativePerWallet: needNative.toString(),
+    ready, of: wallets.length,
+    totalPriorityFeeLamports: totalPriority.toString(),
+    totalPriorityFeeSol: Number(totalPriority) / 1e9,
   });
 
   const mintAccount = await getAccount(cfg.httpUrl, cfg.mint.toBase58(), { commitment: 'confirmed' });
@@ -337,6 +364,8 @@ async function commandArm(cfg, wallets) {
     baseTokenProgram: cfg.baseTokenProgram,
     buyers: wallets.map((w) => ({
       keypair: w.keypair, amountIn: w.amountIn, minimumAmountOut: w.minimumAmountOut, label: w.label,
+      computeUnitPriceMicroLamports: w.computeUnitPriceMicroLamports,
+      computeUnitLimit: w.computeUnitLimit,
     })),
     computeUnitLimit: cfg.computeUnitLimit,
     computeUnitPriceMicroLamports: cfg.computeUnitPriceMicroLamports,

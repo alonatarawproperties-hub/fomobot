@@ -52,21 +52,22 @@
     "baseTokenProgram": null,
     "_quote_comment": "What you pay in. Defaults to wrapped SOL. This MUST match the config's quote mint; arming refuses if it does not.",
     "quoteMint": "So11111111111111111111111111111111111111112",
-    "_wallets_comment": "SEVERAL WALLETS, ONE LAUNCH. Each entry names the ENVIRONMENT VARIABLE holding that wallet's key -- never the key itself -- and what that wallet spends. Every wallet needs its own wrapped quote balance AND its own native SOL (token-account rent plus fees, roughly 0.0021 SOL plus the priority fee). `prepare` funds them all; `plan` reports which are short. A wallet that is short at arm time is DROPPED with a warning, not fatal: four of five is still a snipe. Delete this list to use the single key in FIRSTFILL_SOLANA_KEY with snipe.amountIn below.",
+    "_wallets_comment": "SEVERAL WALLETS, ONE LAUNCH. Each entry names the ENVIRONMENT VARIABLE holding that wallet's key -- never the key itself -- and what that wallet spends. Every wallet needs its own wrapped quote balance AND its own native SOL (token-account rent plus fees). `prepare` funds them all; `plan` reports which are short. A wallet that is short at arm time is DROPPED with a warning, not fatal: four of five is still a snipe. computeUnitPriceMicroLamports is OPTIONAL per wallet and overrides the global one: wallets racing a single launch all write the same pool account, so they cannot execute in parallel and the block takes them in FEE ORDER -- bid higher on the wallets you most want filled first. Delete this list to use the single key in FIRSTFILL_SOLANA_KEY with snipe.amountIn below.",
     "wallets": [
       {
         "label": "w1",
-        "keyEnv": "FIRSTFILL_SOLANA_KEY",
+        "keyEnv": "SNIPE_WALLET_1",
         "amountIn": "150000000"
       },
       {
         "label": "w2",
-        "keyEnv": "FIRSTFILL_SOLANA_KEY_2",
-        "amountIn": "80000000"
+        "keyEnv": "SNIPE_WALLET_2",
+        "amountIn": "80000000",
+        "computeUnitPriceMicroLamports": 80000000
       },
       {
         "label": "w3",
-        "keyEnv": "FIRSTFILL_SOLANA_KEY_3",
+        "keyEnv": "SNIPE_WALLET_3",
         "amountIn": "45000000"
       }
     ],

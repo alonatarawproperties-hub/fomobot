@@ -621,4 +621,91 @@ function multiSniper(sizes, over = {}) {
   ok('resending stops for a wallet once its outcome is known');
 }
 
+{
+  // LADDERED BIDS. Several wallets racing one launch all write the same pool
+  // account, so they cannot execute in parallel — the block takes them in fee
+  // order. Bidding lets an operator choose which of their own wallets gets in
+  // first when not all of them fit.
+  const sniper = new DbcSniper({
+    wsUrl: 'ws://o', httpUrl: 'http://o', mint: MINT, quoteMint: WSOL_MINT,
+    computeUnitLimit: 110_000, computeUnitPriceMicroLamports: 5_000_000,
+    buyers: [
+      { keypair: KP(80), amountIn: 1n, minimumAmountOut: 0n, label: 'small' },
+      { keypair: KP(81), amountIn: 2n, minimumAmountOut: 0n, label: 'big', computeUnitPriceMicroLamports: 80_000_000 },
+    ],
+  });
+  const [small, big] = sniper.buyers;
+  // The default applies where nothing is said.
+  assert.equal(small.computeUnitPriceMicroLamports, 5_000_000);
+  assert.equal(small.priorityFeeLamports, 550_000n);
+  // limit * price / 1e6, per wallet.
+  assert.equal(big.computeUnitPriceMicroLamports, 80_000_000);
+  assert.equal(big.priorityFeeLamports, 8_800_000n);
+  assert.ok(big.priorityFeeLamports > small.priorityFeeLamports, 'the bidder outbids');
+  // And what each must hold in native SOL follows its own bid, not one figure.
+  assert.equal(sniper.lamportsNeededFor(small), 550_000n + 5_000n + 2_100_000n);
+  assert.equal(sniper.lamportsNeededFor(big), 8_800_000n + 5_000n + 2_100_000n);
+  ok('a wallet can outbid the others, and its native requirement follows its own bid');
+}
+{
+  assert.throws(() => new DbcSniper({
+    wsUrl: 'ws://o', httpUrl: 'http://o', mint: MINT, quoteMint: WSOL_MINT,
+    buyers: [{ keypair: KP(82), amountIn: 1n, minimumAmountOut: 0n, computeUnitPriceMicroLamports: -1 }],
+  }), /computeUnitPriceMicroLamports must be a non-negative integer/);
+  assert.throws(() => new DbcSniper({
+    wsUrl: 'ws://o', httpUrl: 'http://o', mint: MINT, quoteMint: WSOL_MINT,
+    buyers: [{ keypair: KP(83), amountIn: 1n, minimumAmountOut: 0n, computeUnitLimit: 0 }],
+  }), /computeUnitLimit must be a positive integer/);
+  ok('a negative bid and a zero compute limit are refused per wallet');
+}
+{
+  // The bid must reach the WIRE, not just the bookkeeping: a ladder that does not
+  // change the signed bytes changes nothing at all.
+  const sizes = [10_000_000n, 20_000_000n];
+  let socket;
+  const sniper = new DbcSniper({
+    wsUrl: 'ws://offline', httpUrl: 'http://offline',
+    mint: MINT, quoteMint: WSOL_MINT, config: null,
+    computeUnitLimit: 110_000, computeUnitPriceMicroLamports: 5_000_000,
+    buyers: [
+      { keypair: KP(84), amountIn: sizes[0], minimumAmountOut: 0n, label: 'low' },
+      { keypair: KP(85), amountIn: sizes[1], minimumAmountOut: 0n, label: 'high', computeUnitPriceMicroLamports: 80_000_000 },
+    ],
+    dryRun: true,
+    wsFactory: () => { socket = new FakeSocket(); return socket; },
+  });
+  sniper.quoteTokenProgram = TOKEN_PROGRAM;
+  sniper.baseTokenProgram = TOKEN_PROGRAM;
+  sniper.blockhashes.current = { blockhash: BLOCKHASH, lastValidBlockHeight: 1, at: Date.now() };
+  sniper.state = STATE.ARMED;
+  const firings = [];
+  sniper.on('firing', (d) => firings.push(d));
+  sniper.start();
+  socket.emit('open', {});
+
+  const realPool = derivePoolAddress(key(86), MINT, WSOL_MINT);
+  socket.message = (obj) => socket.emit('message', { data: JSON.stringify(obj) });
+  socket.message(programNotification(poolBlob({ config: key(86), pool: realPool }), realPool.toBase58()));
+  await new Promise((r) => setImmediate(r));
+
+  // Reported highest-bidder-first, which is the order the block is expected to
+  // take them in.
+  assert.equal(firings[0].signatures[0].label, 'high');
+  assert.equal(firings[0].signatures[0].priorityFee, '8800000');
+  assert.equal(firings[0].signatures[1].label, 'low');
+  assert.equal(firings[0].totalPriorityFee, String(8_800_000n + 550_000n));
+
+  // And the bytes differ, because the SetComputeUnitPrice instruction differs.
+  const lowTx = VersionedTransaction.deserialize(Buffer.from(sniper.buyers[0].presigned.base64, 'base64'));
+  const highTx = VersionedTransaction.deserialize(Buffer.from(sniper.buyers[1].presigned.base64, 'base64'));
+  const priceIx = (tx) => Buffer.from(tx.message.compiledInstructions[1].data);
+  assert.notEqual(priceIx(lowTx).toString('hex'), priceIx(highTx).toString('hex'));
+  // Discriminator 3 = SetComputeUnitPrice, then the price as a u64.
+  assert.equal(priceIx(lowTx)[0], 3);
+  assert.equal(priceIx(lowTx).readBigUInt64LE(1), 5_000_000n);
+  assert.equal(priceIx(highTx).readBigUInt64LE(1), 80_000_000n);
+  ok('the bid reaches the signed bytes, not just the reporting');
+  sniper.stop();
+}
+
 console.log(`\n${pass} checks passed\n`);
