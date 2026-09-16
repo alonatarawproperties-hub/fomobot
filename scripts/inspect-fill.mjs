@@ -78,13 +78,25 @@ if (used !== null) {
     overpaidLamports: (budget && price) ? Math.round((budget - used) * price / 1e6) : null,
   });
   if (budget && used) {
-    // 15% over the observed peak: enough for a pool whose curve costs a little
-    // more to touch, without paying for a ceiling nothing will reach.
-    const suggested = Math.ceil((used * 1.15) / 1000) * 1000;
+    // MARGIN IS NOT A ROUNDING CHOICE HERE.
+    //
+    // The instinct is to trim to the observed peak plus a little, the way you
+    // would for a transaction that runs a thousand times a day. This one runs
+    // ONCE, on an event that does not repeat, and exceeding the limit does not
+    // cost a retry — it fails the snipe outright. Meanwhile the money at stake in
+    // trimming is a fraction of a cent.
+    //
+    // So the multiple is deliberately generous: a curve shaped differently, an
+    // account that already exists, a token program with a transfer hook, all move
+    // consumption without warning. 2.5x the observed peak, floored at 60k.
+    const suggested = Math.max(60_000, Math.ceil((used * 2.5) / 10_000) * 10_000);
+    const saving = price ? Math.round((budget - suggested) * price / 1e6) : null;
     log('info', 'suggested computeUnitLimit', {
       value: suggested,
-      why: `${used} actually consumed, plus 15% margin, rounded up`,
-      savesLamportsPerAttempt: price ? Math.round((budget - suggested) * price / 1e6) : null,
+      why: `${used} consumed; 2.5x margin because exceeding the limit fails the snipe and the launch does not repeat`,
+      savesLamportsPerAttempt: saving,
+      savesSol: saving != null ? saving / 1e9 : null,
+      warning: 'do NOT trim this to just above the observed peak — the saving is a fraction of a cent, the failure is the whole entry',
     });
   }
 }
