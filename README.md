@@ -497,3 +497,130 @@ already shipped in test files that nothing was executing.
 The executor suite's last four cases read `index.mjs` **as source**, because no
 unit call can prove a caller wired a gate in. All four were verified by deleting
 the guard and watching them go red.
+
+---
+
+## Sniping a Solana launch on a Meteora curve
+
+A different job from everything above, and deliberately separate from it. The
+copy-trading path reacts to a *trader*; this reacts to a *launch* whose token
+address is known in advance. None of it is wired into the roster, the policy gate
+or the executor — `src/meteora-dbc.mjs` and `scripts/dbc-probe.mjs` stand alone.
+
+Everything below was read off mainnet on 2026-09-16 and is re-checked by
+`node test-dbc.mjs`, which derives five addresses and one instruction payload and
+compares them against values observed in real transactions.
+
+### The venue
+
+`dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN` is Meteora's Dynamic Bonding Curve.
+Buys and sells are one instruction, `Swap2`, discriminator `414b3f4ceb5b5b88` —
+which is also `sha256("global:swap2")[0..8]`, so the name and the bytes confirm
+each other. It takes 15 accounts and `(amountIn, minimumAmountOut, mode)`.
+
+**A launch is one atomic transaction.** `InitializeVirtualPoolWithToken2022`
+creates the mint, the vaults, the metadata, mints the entire supply, revokes mint
+and freeze authority, and creates the pool. Two consequences:
+
+- The token **does not exist** before the launch. Being given the address in
+  advance means somebody pre-generated the mint keypair.
+- There is **no gap between existing and being tradeable**. The configs sampled
+  carry no activation slot or timestamp — scanning every 8-byte window in one
+  turned up no value resembling either — so the curve is live on creation. There
+  is no scheduled moment to aim at, and nothing to wait for.
+
+### What a reactive bot actually gets, measured
+
+One launch, caught live on the same `logsSubscribe` mechanism `src/solana.mjs`
+already uses (mint `9SgwHTxL4pNwfKoTWuG7yMNV3z4ptJCkAgt3HwnXw8qT`, created slot
+447445706):
+
+```
++0 slots    three separate buys, inside the creation slot itself
++1 slot     a fourth
++42 slots   (~17s) the next wave, and everything after it
+```
+
+Those first three **cannot have reacted to the creation.** A `logsSubscribe`
+notification is emitted only after the slot is processed, so the earliest a
+listener can even know the pool exists is already too late. They were sending to
+the pool address before the pool existed.
+
+That is the whole finding: **detection is not the bottleneck, and making detection
+faster does not help.** A bot that waits to be told lands in the +42 wave, about
+17 seconds in, alongside everyone reading a feed. Getting into the creation slot
+requires knowing the pool's address ahead of time and sending blind.
+
+### Which means the config is the only thing that matters
+
+The pool is a PDA, derivable before it exists:
+
+```
+pool       = PDA(["pool", config, max(baseMint,quoteMint), min(baseMint,quoteMint)])
+baseVault  = PDA(["token_vault", baseMint,  pool])
+quoteVault = PDA(["token_vault", quoteMint, pool])
+poolAuthority  = PDA(["pool_authority"])     FhVo3mqL8PW5pH5U2CN4XE33DokiyZnUwuGpH2hmHLuM
+eventAuthority = PDA(["__event_authority"])  8Ks12pbrD6PXxfty1hVQiE9sc289zgU1zHkvXhrSdriF
+```
+
+**The two mints are sorted, not passed in role order.** Established, not assumed:
+across 54,371 pools whose base mint sorts below wSOL — the only pools where the
+orderings differ — 47,749 matched sorted and **zero** matched `(base, quote)`. The
+other 6,622 are quoted in something other than wSOL and correctly match neither.
+wSOL's first byte is `0x06`, so ~98% of mints sort above it and the bug is
+invisible for all of them.
+
+So the mint is not enough. **The config is the one input that cannot be derived or
+guessed**, and 504,063 of them exist. They are long-lived and shared — the one
+sampled was created ~1.3 days before the pool that used it, and 27 pools share it
+— so a config *can* be known before a launch, but only by being told it, or by
+recognising the launchpad from pools it created earlier.
+
+- **With the config:** the pool address is computable now, a transaction can be
+  built now, and a same-slot entry is possible.
+- **Without it:** the pool can only be *found* after it exists —
+  `getProgramAccounts` with a memcmp on `base_mint` at offset 136 returns it in
+  ~80–260ms — and the entry lands in the +42 wave.
+
+### The exit is a second venue, and it appears without warning
+
+A DBC pool has a finite life. When the curve completes, `MigrationDammV2` moves
+both reserves into a Meteora DAMM v2 (cp-amm) pool and locks the position; the DBC
+pool keeps its account and its history but holds dust. Confirmed on the reference
+launch: DBC reserves fell from 15.81 SOL to 0.0559 SOL, and the migration
+transaction created DAMM v2 pool `C4shWUr7m7Z4eAsknbeNZVrJRQg6Q8H6ymoo3uQ7u9Et`.
+
+**A position held through migration must be sold on a different program.** An exit
+that only knows `Swap2` stops working at the exact moment the token succeeds. The
+probe detects this by asking DAMM v2 directly rather than inferring it from
+drained reserves, because drained reserves also look like a dead launch.
+
+### Probing the address before the launch
+
+```sh
+node scripts/dbc-probe.mjs <mint> [--config <config>] [--rpc <url>]
+```
+
+Read-only; it signs nothing and needs no key. It reports whether the mint exists,
+whether a pool exists and what its curve looks like, which config it is on, and
+whether it has already migrated. With `--config` it prints the pool and vault
+addresses the launch **will** use, derived before it happens.
+
+It also reports what decides whether the position can be exited at all: a live
+freeze authority, a Token-2022 **transfer hook** (arbitrary code on every
+transfer, including yours), a transfer fee, a permanent delegate, or a default
+frozen account state. DBC launches are commonly Token-2022, so these are live
+risks rather than theory. An address that exists but is not a mint is called out
+as such — an earlier version reported one as a clean token with zero supply.
+
+### What is NOT established
+
+- **No transaction has been signed or sent.** Everything above is read-only. The
+  signing, fee and submission path does not exist yet, and the numbers that decide
+  whether a same-slot entry is actually winnable from a given box — priority fee
+  levels, whether Jito bundles are needed, how many blind attempts it costs — have
+  not been measured.
+- **Whether sniping this launch is a good idea at all is a separate question from
+  whether it is possible.** The Robinhood Chain measurements above found the median
+  launch down 2.8% thirty seconds in, with only 40% up at all. Nothing here
+  suggests Solana is kinder.
