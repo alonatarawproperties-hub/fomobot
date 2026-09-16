@@ -166,8 +166,20 @@ if (rederived.toBase58() === poolAddress) {
 }
 
 console.log();
-log('info', 'put this in config.json', {
-  'snipe.config': pool.config.toBase58(),
+
+// WHAT IS SAFE TO CARRY OVER, AND WHAT IS NOT.
+//
+// The config belongs to THIS launch. Launchpads that mint a fresh config per
+// launch — generated in the same bundle that creates the pool — make it useless
+// for the next one, and worse than useless if pasted into config.json: the pool
+// derived from it is a real address belonging to a different pool. Everything
+// else here is a property of the launchpad rather than the launch, so it carries.
+log('info', 'SAFE TO COPY — these are launchpad-wide', {
   'snipe.quoteMint': cfg.quoteMint.toBase58(),
-  caveat: 'valid only if YOUR launch uses the same launchpad and the same config. `plan` re-checks it.',
+  'snipe.baseTokenProgram': tokenProgramFor(cfg.tokenType).toBase58(),
+});
+log('warn', 'DO NOT COPY snipe.config UNLESS THE LAUNCHPAD REUSES IT', {
+  config: pool.config.toBase58(),
+  why: 'many launchpads generate a fresh config per launch, so this one belongs to the token above and no other',
+  ifUnsure: 'leave snipe.config null — the bot discovers the pool from the trigger notification either way',
 });
