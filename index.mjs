@@ -519,7 +519,7 @@ if (solEntries.length) {
     const lagMs = e.enrichedAt - e.seenAt;
     log('signal', 'solana classified', { handle, side: t.side, mint: t.mint, lagMs });
     recorder.write({
-      kind: t.side === 'funding' ? 'funding' : 'trade',
+      kind: t.side === 'funding' ? 'funding' : t.side === 'transfer' ? 'transfer' : 'trade',
       chain: 'solana', handle, wallet: e.address, signature: e.signature,
       slot: e.slot, side: t.side, direction: t.direction ?? null, mint: t.mint,
       amount: t.amount?.toString() ?? null, decimals: t.decimals,
@@ -535,6 +535,17 @@ if (solEntries.length) {
       notifier.send(
         `💵 <b>${handle}</b> funding ${t.direction}\n` +
         `<code>${pretty}</code> — no token traded`
+      );
+      return;
+    }
+
+    if (t.side === 'transfer') {
+      // A token arrived or left without a venue being invoked. Visible, because
+      // it is real movement — but never dressed up as a trade.
+      notifier.send(
+        `📦 <b>${handle}</b> token transfer ${t.direction} — NOT a buy\n` +
+        `<code>${t.mint}</code>\n` +
+        `amount <code>${pretty}</code> — no swap venue in the transaction`
       );
       return;
     }

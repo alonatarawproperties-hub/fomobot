@@ -176,4 +176,46 @@ console.log('\na transfer into the wallet is not a buy');
   ok('a real router buy with no quote leg still reads as a buy');
 }
 
+{
+  // A token contract handing tokens out by some OTHER method -- a claim, a mint,
+  // a vesting release. The selector rule cannot see these, but the target can:
+  // you do not buy a token by calling the token.
+  const TOKEN = '0x08ae92d3afa1a3e20a4ab738a8d8ecf0e644c5f1';
+  const HIM = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+  const pad = (a) => '0x' + '0'.repeat(24) + a.slice(2);
+  const receipt = {
+    status: '0x1',
+    logs: [{
+      address: TOKEN,
+      topics: [TRANSFER_TOPIC, pad('0x0000000000000000000000000000000000000000'), pad(HIM)],
+      data: '0x' + (777n).toString(16).padStart(64, '0'),
+    }],
+  };
+  // Some arbitrary claim selector, not a transfer one.
+  const t = classifyRhTrade(receipt, HIM, undefined, { to: TOKEN, selector: '0x4e71d92d' });
+  assert.equal(t.side, 'transfer');
+  assert.equal(t.why, 'target-is-the-token-itself');
+  assert.equal(isRhTrade(t), false);
+  ok('a claim on the token contract is not a buy, whatever the selector');
+}
+{
+  // The real buy goes through a ROUTER, so its target is not the token -- it must
+  // still read as a buy. This is the case the target rule must not break.
+  const TWINE = '0xe27501d787d647cc82a5b4a7eafd5750386f1b77';
+  const HIM = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+  const pad = (a) => '0x' + '0'.repeat(24) + a.slice(2);
+  const receipt = {
+    status: '0x1',
+    logs: [{
+      address: TWINE,
+      topics: [TRANSFER_TOPIC, pad('0x4444444444444444444444444444444444444444'), pad(HIM)],
+      data: '0x' + (298050709030000000000000n).toString(16).padStart(64, '0'),
+    }],
+  };
+  const t = classifyRhTrade(receipt, HIM, undefined, { to: '0xccc88a9d00000000000000000000000000c315be', selector: '0x3593564c' });
+  assert.equal(t.side, 'buy');
+  assert.equal(isRhTrade(t), true);
+  ok('a router buy is untouched by the target rule');
+}
+
 console.log(`\n${pass} passed\n`);

@@ -117,16 +117,28 @@ export function classifyRhTrade(receipt, owner, quoteTokens = QUOTE_TOKENS, call
 
   const subject = deltas.find((d) => !quoteTokens.has(d.token));
   if (subject) {
-    // A direct transfer() is a token moving, not a token being bought. Reported
-    // as what it is so the operator still sees it, and so the recorder keeps the
-    // evidence — but isRhTrade is false, so nothing copies it.
-    if (call && TRANSFER_SELECTORS.has(lower(call.selector))) {
+    // NOT A PURCHASE, on either of two counts.
+    //
+    // A direct transfer() is a token moving rather than being bought — that is
+    // the case seen live on 2026-09-17.
+    //
+    // And a transaction whose TARGET is the token that arrived cannot be a
+    // purchase whatever method it called: you do not buy a token by calling the
+    // token. That catches a claim, a mint, a vesting release and anything else
+    // the token contract itself hands out, none of which the selector rule sees.
+    //
+    // Reported as what it is so the operator still sees the movement, and the
+    // recorder keeps the evidence — but isRhTrade is false, so nothing copies it.
+    const selector = lower(call?.selector);
+    const targetIsTheToken = call?.to && lower(call.to) === subject.token;
+    if (call && (TRANSFER_SELECTORS.has(selector) || targetIsTheToken)) {
       return {
         side: 'transfer',
         direction: subject.delta > 0n ? 'in' : 'out',
         token: subject.token,
         amount: subject.delta > 0n ? subject.delta : -subject.delta,
-        selector: lower(call.selector),
+        selector: selector || null,
+        why: TRANSFER_SELECTORS.has(selector) ? 'transfer-selector' : 'target-is-the-token-itself',
       };
     }
     return {

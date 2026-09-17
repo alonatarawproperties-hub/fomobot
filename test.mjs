@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { Wallet, Transaction, AbiCoder } from 'ethers';
 import { extractSignedTxs, decodeFrame } from './src/decode.mjs';
 import { Roster, toSignal } from './src/matcher.mjs';
-import { classifyTrade, tokenDeltas, isTrade } from './src/solana.mjs';
+import { classifyTrade, tokenDeltas, isTrade, isPlainTransfer, NON_SWAP_PROGRAMS } from './src/solana.mjs';
 
 const CHAIN_ID = 4663;
 let pass = 0;
@@ -290,6 +290,86 @@ console.log('\nfeed stall alarm (read as source)');
     'the open handler must not clear the stall flag — a connected socket is not a receiving one');
   assert.match(FEED, /this\.stalled\s*=\s*false;\s*this\.emit\('recovered'/);
   ok('a stall clears only when frames actually resume, and says so');
+}
+
+
+// ---------------------------------------------------------------------------
+console.log('\na Solana transfer into the wallet is not a buy');
+
+const SOL_TOKEN_PROG = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const SOL_OWNER = 'ownerownerownerownerownerownerownerowner11';
+const SOL_MEME = 'MemeMemeMemeMemeMemeMemeMemeMemeMemeMeme111';
+const SOL_RAYDIUM = '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8';
+
+const solTx = (instructions, { pre, post }) => ({
+  transaction: { message: { instructions } },
+  meta: {
+    preTokenBalances: pre,
+    postTokenBalances: post,
+  },
+});
+const solBal = (mint, owner, amount, decimals = 6) => ({ mint, owner, uiTokenAmount: { amount: String(amount), decimals } });
+
+{
+  // A plain SPL transfer INTO the wallet: token arrives, no venue invoked.
+  const tx = solTx(
+    [{ programId: SOL_TOKEN_PROG, program: 'spl-token', parsed: { type: 'transfer' } }],
+    { pre: [solBal(SOL_MEME, SOL_OWNER, 0)], post: [solBal(SOL_MEME, SOL_OWNER, 5_000_000)] },
+  );
+  const t = classifyTrade(tx, SOL_OWNER);
+  assert.equal(t.side, 'transfer');
+  assert.equal(t.direction, 'in');
+  assert.equal(t.mint, SOL_MEME);
+  assert.equal(t.amount, 5_000_000n);
+  assert.equal(isTrade(t), false, 'a transfer must never be copied');
+  ok('an SPL transfer in reads as a transfer, not a buy');
+}
+{
+  // The SAME balance change, but a venue was invoked — that is a real buy, and
+  // it must still read as one. This is the case a careless fix breaks.
+  const tx = solTx(
+    [
+      { programId: 'ComputeBudget111111111111111111111111111111' },
+      { programId: SOL_RAYDIUM },
+    ],
+    { pre: [solBal(SOL_MEME, SOL_OWNER, 0)], post: [solBal(SOL_MEME, SOL_OWNER, 5_000_000)] },
+  );
+  const t = classifyTrade(tx, SOL_OWNER);
+  assert.equal(t.side, 'buy');
+  assert.equal(isTrade(t), true);
+  ok('the same balance change through a venue is still a buy');
+}
+{
+  const tx = solTx(
+    [{ programId: SOL_TOKEN_PROG }],
+    { pre: [solBal(SOL_MEME, SOL_OWNER, 9_000_000)], post: [solBal(SOL_MEME, SOL_OWNER, 0)] },
+  );
+  const t = classifyTrade(tx, SOL_OWNER);
+  assert.equal(t.side, 'transfer');
+  assert.equal(t.direction, 'out');
+  assert.equal(isTrade(t), false);
+  ok('an SPL transfer out reads as a transfer, not a sell');
+}
+{
+  // An unreadable instruction list must NOT be dismissed as a transfer — fall
+  // back to the balances, which is the behaviour that existed before.
+  const noIx = { transaction: {}, meta: { preTokenBalances: [solBal(SOL_MEME, SOL_OWNER, 0)], postTokenBalances: [solBal(SOL_MEME, SOL_OWNER, 1_000)] } };
+  assert.equal(isPlainTransfer(noIx), false);
+  assert.equal(classifyTrade(noIx, SOL_OWNER).side, 'buy');
+  ok('a transaction whose instructions cannot be read is classified by balances, as before');
+}
+{
+  // Wrapping SOL is System + Token only, and moves only quote — still funding.
+  const tx = solTx(
+    [{ programId: '11111111111111111111111111111111' }, { programId: SOL_TOKEN_PROG }],
+    {
+      pre: [solBal('So11111111111111111111111111111111111111112', SOL_OWNER, 0, 9)],
+      post: [solBal('So11111111111111111111111111111111111111112', SOL_OWNER, 2_000_000_000, 9)],
+    },
+  );
+  const t = classifyTrade(tx, SOL_OWNER);
+  assert.equal(t.side, 'funding', 'quote-only movement is funding, whatever the programs');
+  ok('quote-only movement is still funding, not a transfer');
 }
 
 console.log(`\n${pass} passed\n`);

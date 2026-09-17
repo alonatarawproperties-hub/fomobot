@@ -481,9 +481,22 @@ what the recorded entries are for, and it is what should decide sizing.
   `transfer()` on the token itself. The classifier now takes the top-level
   selector and refuses to call `transfer` / `transferFrom` a trade. Being wrong
   there costs a skipped signal rather than a purchase nobody asked for.
-- **The same hole is still open on Solana.** `classifyTrade` reads pre/post
-  balances, so an SPL transfer or an airdrop into the watched wallet reads as a
-  buy exactly as the EVM side did. Not yet fixed.
+- **Solana is fixed the same way, by a different signal.** There is no selector to
+  read, so `classifyTrade` asks whether any program outside Token / Token-2022 /
+  ATA / System / ComputeBudget / Memo was invoked at the TOP level. A swap always
+  reaches a venue; a transfer or an airdrop does not. Inner instructions are
+  ignored on purpose — a swap is *made of* token transfers, so reading those
+  would demote every real trade.
+- **WHAT IS STILL NOT CAUGHT, on either chain.** Two rules now refuse a "buy": a
+  `transfer`/`transferFrom` selector, and a transaction whose target is the token
+  that arrived. Neither sees a token arriving from a **third-party contract** —
+  an airdrop distributor, a vesting escrow, a rewards claim, a bridge. Those
+  invoke a contract that is not the token, so they still read as a buy.
+  Distinguishing them needs a whitelist of venues that count as trading, which is
+  not built: fomo's router is proprietary and can be redeployed, and a stale
+  whitelist would stop copying real buys silently. **So the classifier is better
+  than it was and is not airtight**, and with the executor live that gap is the
+  operator's to weigh.
 - **No Telegram control plane yet.** The bot talks; it does not listen. `/pause`,
   `/positions` and a force-exit are not built, so stopping it means stopping the
   process.
