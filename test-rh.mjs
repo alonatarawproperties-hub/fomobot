@@ -99,4 +99,81 @@ console.log('\nrobinhood classifier');
   ok('empty, malformed and ownerless inputs yield nothing rather than throwing');
 }
 
+
+// ---------------------------------------------------------------------------
+console.log('\na transfer into the wallet is not a buy');
+
+{
+  // THE LIVE FALSE POSITIVE, 2026-09-17. Two alerts fired as "BUY on Robinhood
+  // Chain" for transactions whose selector was plain ERC-20 transfer(), sending a
+  // token INTO the watched wallet. Nothing was bought, and they never showed as
+  // trades on his profile because they are not trades.
+  const TOKEN = '0x08ae92d3afa1a3e20a4ab738a8d8ecf0e644c5f1';
+  const HIM = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+  const SOMEONE = '0x1111111111111111111111111111111111111111';
+  const pad = (a) => '0x' + '0'.repeat(24) + a.slice(2);
+
+  const receipt = {
+    status: '0x1',
+    logs: [{
+      address: TOKEN,
+      topics: [TRANSFER_TOPIC, pad(SOMEONE), pad(HIM)],
+      data: '0x' + (12345n).toString(16).padStart(64, '0'),
+    }],
+  };
+
+  // Without the call, deltas alone read it as a buy — which is exactly what
+  // happened live, and is NOT a bug in the deltas: a real buy looks identical,
+  // because fomo pays from a pooled account and never moves quote through his
+  // wallet. The selector is the only thing that separates them.
+  const blind = classifyRhTrade(receipt, HIM);
+  assert.equal(blind.side, 'buy');
+
+  const seen = classifyRhTrade(receipt, HIM, undefined, { to: TOKEN, selector: '0xa9059cbb' });
+  assert.equal(seen.side, 'transfer');
+  assert.equal(seen.direction, 'in');
+  assert.equal(seen.token, TOKEN);
+  assert.equal(seen.amount, 12345n);
+  assert.equal(isRhTrade(seen), false, 'a transfer must never be copied');
+  ok('a direct transfer() into the wallet reads as a transfer, not a buy');
+}
+{
+  const TOKEN = '0x08ae92d3afa1a3e20a4ab738a8d8ecf0e644c5f1';
+  const HIM = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+  const pad = (a) => '0x' + '0'.repeat(24) + a.slice(2);
+  const receipt = {
+    status: '0x1',
+    logs: [{
+      address: TOKEN,
+      topics: [TRANSFER_TOPIC, pad(HIM), pad('0x2222222222222222222222222222222222222222')],
+      data: '0x' + (999n).toString(16).padStart(64, '0'),
+    }],
+  };
+  const out = classifyRhTrade(receipt, HIM, undefined, { to: TOKEN, selector: '0x23b872dd' });
+  assert.equal(out.side, 'transfer');
+  assert.equal(out.direction, 'out');
+  assert.equal(isRhTrade(out), false);
+  ok('transferFrom out of the wallet is a transfer, not a sell');
+}
+{
+  // AND THE REAL BUY MUST STILL READ AS A BUY. His first confirmed Robinhood
+  // Chain buy had no quote leg at all -- one token inbound, nothing out -- so a
+  // fix that demanded a quote leg would have silently stopped copying him.
+  const TWINE = '0x3333333333333333333333333333333333333333';
+  const HIM = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+  const pad = (a) => '0x' + '0'.repeat(24) + a.slice(2);
+  const receipt = {
+    status: '0x1',
+    logs: [{
+      address: TWINE,
+      topics: [TRANSFER_TOPIC, pad('0x4444444444444444444444444444444444444444'), pad(HIM)],
+      data: '0x' + (298050709030000000000000n).toString(16).padStart(64, '0'),
+    }],
+  };
+  const buy = classifyRhTrade(receipt, HIM, undefined, { to: '0xccc88a9d00000000000000000000000000c315be', selector: '0x3593564c' });
+  assert.equal(buy.side, 'buy', 'a router call with a token inbound is still a buy');
+  assert.equal(isRhTrade(buy), true);
+  ok('a real router buy with no quote leg still reads as a buy');
+}
+
 console.log(`\n${pass} passed\n`);

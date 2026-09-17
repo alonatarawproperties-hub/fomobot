@@ -470,7 +470,20 @@ what the recorded entries are for, and it is what should decide sizing.
   works from the receipt rather than the feed sighting, which is why.
 - The calldata match is a substring test. It cannot produce a false negative, but
   an address appearing in unrelated calldata would be a false positive — which is
-  why `via` is recorded.
+  why `via` is recorded. **This happened live on 2026-09-17**: two transactions
+  alerted as `BUY on Robinhood Chain` were plain `transfer()` calls moving a token
+  INTO the watched wallet. Nothing was bought, and they never appeared as trades
+  on his profile because they are not trades. See below.
+- **A token arriving is not a purchase, and deltas cannot tell the difference.**
+  A real buy has no quote leg — fomo pays from a pooled account — so "token in,
+  nothing out" describes both a buy and a gift. The only thing that separates them
+  is the call: a swap goes through a router, and nobody buys a token by calling
+  `transfer()` on the token itself. The classifier now takes the top-level
+  selector and refuses to call `transfer` / `transferFrom` a trade. Being wrong
+  there costs a skipped signal rather than a purchase nobody asked for.
+- **The same hole is still open on Solana.** `classifyTrade` reads pre/post
+  balances, so an SPL transfer or an airdrop into the watched wallet reads as a
+  buy exactly as the EVM side did. Not yet fixed.
 - **No Telegram control plane yet.** The bot talks; it does not listen. `/pause`,
   `/positions` and a force-exit are not built, so stopping it means stopping the
   process.

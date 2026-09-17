@@ -275,9 +275,12 @@ async function handleRhSignal(sig) {
     return;
   }
 
-  const trade = classifyRhTrade(receipt, sig.trader);
+  // The selector matters: a plain ERC-20 transfer moves a token into the wallet
+  // and is indistinguishable from a buy by deltas alone, because fomo pays from a
+  // pooled account and a real buy has no quote leg either.
+  const trade = classifyRhTrade(receipt, sig.trader, undefined, { to: sig.to, selector: sig.selector });
   recorder.write({
-    kind: isRhTrade(trade) ? 'trade' : trade.side === 'funding' ? 'funding' : 'non-trade',
+    kind: isRhTrade(trade) ? 'trade' : trade.side === 'funding' ? 'funding' : trade.side === 'transfer' ? 'transfer' : 'non-trade',
     chain: 'robinhood', handle: sig.handle, wallet: sig.trader, txHash: sig.txHash,
     side: trade.side, direction: trade.direction ?? null, token: trade.token,
     amount: trade.amount?.toString() ?? null, seenAt: sig.seenAt, classifiedAt: Date.now(),
@@ -286,6 +289,12 @@ async function handleRhSignal(sig) {
   if (!isRhTrade(trade)) {
     if (trade.side === 'funding') {
       notifier.send(`\u{1F4B5} <b>${esc(sig.handle)}</b> funding ${trade.direction} on Robinhood Chain \u2014 no token traded`);
+    } else if (trade.side === 'transfer') {
+      notifier.send(
+        `\u{1F4E6} <b>${esc(sig.handle)}</b> token transfer ${trade.direction} on Robinhood Chain \u2014 NOT a buy\n`
+        + `<code>${esc(trade.token)}</code>\n`
+        + `a direct <code>${esc(trade.selector)}</code> call, not a swap \u2014 nothing was bought`,
+      );
     }
     return;
   }
