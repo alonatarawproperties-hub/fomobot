@@ -487,7 +487,21 @@ what the recorded entries are for, and it is what should decide sizing.
   reaches a venue; a transfer or an airdrop does not. Inner instructions are
   ignored on purpose — a swap is *made of* token transfers, so reading those
   would demote every real trade.
-- **WHAT IS STILL NOT CAUGHT, on either chain.** Two rules now refuse a "buy": a
+- **The venue whitelist closes that, and is OFF by default.** `executor.venues`
+  lists contracts that count as trading venues. With it set, a purchase must go
+  through one; a token arriving any other way is `received` and never copied.
+  Matched against the transaction target AND every log emitter, because his
+  trades arrive via a bundler whose target is an entry point rather than a
+  router. **The addresses are deliberately not in the source**: fomo's router is
+  proprietary and redeployable, and a hardcoded one would stop copying real buys
+  the day it changed. Read them off a known-good buy with
+  `npm run find-venues -- <txHash>`.
+- **An unmatched arrival is loud, not silent.** "He was airdropped something" and
+  "fomo redeployed their router" look identical to the classifier, and only a
+  human can tell them apart — so the bot says so and names the transaction to run
+  `find-venues` on. Missing a buy while being told is survivable; missing one in
+  silence is not, which is the whole reason the whitelist is opt-in.
+- **WHAT IS STILL NOT CAUGHT WITHOUT IT, on either chain.** Two rules now refuse a "buy": a
   `transfer`/`transferFrom` selector, and a transaction whose target is the token
   that arrived. Neither sees a token arriving from a **third-party contract** —
   an airdrop distributor, a vesting escrow, a rewards claim, a bridge. Those

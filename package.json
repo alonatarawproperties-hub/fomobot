@@ -12,7 +12,7 @@
     "dry": "node index.mjs --dry",
     "test": "npm run check && node test.mjs && node test-m02.mjs && node test-positions.mjs && node test-rh.mjs && node test-aggregator.mjs && node test-executor.mjs && node test-control.mjs && node test-meteora.mjs && node test-sniper.mjs",
     "survey": "node survey.mjs 60",
-    "check": "node --check index.mjs && node --check scripts/new-wallet.mjs && node --check scripts/configure-executor.mjs && node --check survey.mjs && node --check test.mjs && node --check test-m02.mjs && node --check test-positions.mjs && node --check test-rh.mjs && node --check test-aggregator.mjs && node --check test-executor.mjs && node --check test-control.mjs && node --check src/feed.mjs && node --check src/decode.mjs && node --check src/matcher.mjs && node --check src/notify.mjs && node --check src/record.mjs && node --check src/solana.mjs && node --check src/policy.mjs && node --check src/sellability.mjs && node --check src/positions.mjs && node --check src/robinhood-trade.mjs && node --check src/chain/robinhood.mjs && node --check src/aggregator.mjs && node --check src/executor.mjs && node --check src/executor-io.mjs && node --check src/control.mjs && node --check src/roster-edit.mjs && node --check src/control-io.mjs && node --check scripts/snipe.mjs && node --check test-meteora.mjs && node --check test-sniper.mjs && node --check src/meteora/dbc.mjs && node --check src/meteora/rpc.mjs && node --check src/meteora/snipe.mjs && node --check src/meteora/sniper.mjs && node --check src/meteora/prepare.mjs && node --check scripts/check-rpc.mjs && node --check scripts/find-config.mjs && node --check scripts/inspect-fill.mjs && node --check scripts/new-wallets.mjs",
+    "check": "node --check index.mjs && node --check scripts/new-wallet.mjs && node --check scripts/configure-executor.mjs && node --check survey.mjs && node --check test.mjs && node --check test-m02.mjs && node --check test-positions.mjs && node --check test-rh.mjs && node --check test-aggregator.mjs && node --check test-executor.mjs && node --check test-control.mjs && node --check src/feed.mjs && node --check src/decode.mjs && node --check src/matcher.mjs && node --check src/notify.mjs && node --check src/record.mjs && node --check src/solana.mjs && node --check src/policy.mjs && node --check src/sellability.mjs && node --check src/positions.mjs && node --check src/robinhood-trade.mjs && node --check src/chain/robinhood.mjs && node --check src/aggregator.mjs && node --check src/executor.mjs && node --check src/executor-io.mjs && node --check src/control.mjs && node --check src/roster-edit.mjs && node --check src/control-io.mjs && node --check scripts/snipe.mjs && node --check test-meteora.mjs && node --check test-sniper.mjs && node --check src/meteora/dbc.mjs && node --check src/meteora/rpc.mjs && node --check src/meteora/snipe.mjs && node --check src/meteora/sniper.mjs && node --check src/meteora/prepare.mjs && node --check scripts/check-rpc.mjs && node --check scripts/find-config.mjs && node --check scripts/inspect-fill.mjs && node --check scripts/new-wallets.mjs && node --check scripts/find-venues.mjs",
     "paper": "node index.mjs --paper",
     "new-wallet": "node scripts/new-wallet.mjs",
     "configure": "node scripts/configure-executor.mjs",
@@ -20,7 +20,8 @@
     "check-rpc": "node scripts/check-rpc.mjs",
     "find-config": "node scripts/find-config.mjs",
     "inspect-fill": "node scripts/inspect-fill.mjs",
-    "new-wallets": "node scripts/new-wallets.mjs"
+    "new-wallets": "node scripts/new-wallets.mjs",
+    "find-venues": "node scripts/find-venues.mjs"
   },
   "dependencies": {
     "@solana/web3.js": "^1.99.0",

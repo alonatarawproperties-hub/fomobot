@@ -1,7 +1,7 @@
 // Offline tests for the Robinhood Chain trade classifier. No chain, no RPC.
 
 import assert from 'node:assert/strict';
-import { erc20Deltas, classifyRhTrade, isRhTrade, TRANSFER_TOPIC } from './src/robinhood-trade.mjs';
+import { erc20Deltas, classifyRhTrade, isRhTrade, venueTouched, TRANSFER_TOPIC } from './src/robinhood-trade.mjs';
 
 let pass = 0;
 const ok = (n) => { console.log(`  ok  ${n}`); pass++; };
@@ -216,6 +216,74 @@ console.log('\na transfer into the wallet is not a buy');
   assert.equal(t.side, 'buy');
   assert.equal(isRhTrade(t), true);
   ok('a router buy is untouched by the target rule');
+}
+
+
+// ---------------------------------------------------------------------------
+console.log('\nthe venue whitelist');
+
+const HIM2 = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+const MEME2 = '0xe27501d787d647cc82a5b4a7eafd5750386f1b77';
+const ROUTER = '0xccc88a9d00000000000000000000000000c315be';
+const ENTRYPOINT = '0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789';
+const pad2 = (a) => '0x' + '0'.repeat(24) + a.slice(2);
+const VENUES = new Set([ROUTER]);
+
+const arrival = (extraLogs = []) => ({
+  status: '0x1',
+  logs: [
+    { address: MEME2, topics: [TRANSFER_TOPIC, pad2('0x4444444444444444444444444444444444444444'), pad2(HIM2)], data: '0x' + (1000n).toString(16).padStart(64, '0') },
+    ...extraLogs,
+  ],
+});
+
+{
+  // The real shape: bundler-sent, so the TARGET is an entry point rather than the
+  // router — but the router still emits, which is why log emitters are checked.
+  const receipt = arrival([{ address: ROUTER, topics: ['0xdeadbeef'], data: '0x' }]);
+  const t = classifyRhTrade(receipt, HIM2, undefined, { to: ENTRYPOINT, selector: '0x3593564c' }, VENUES);
+  assert.equal(t.side, 'buy');
+  assert.equal(t.venue, ROUTER);
+  assert.equal(isRhTrade(t), true);
+  ok('a buy through a known venue is copied, even when the target is a bundler');
+}
+{
+  // The same arrival with NO known venue anywhere. This is an airdrop — or the
+  // router just moved. Reported, never copied.
+  const t = classifyRhTrade(arrival(), HIM2, undefined, { to: '0x9999999999999999999999999999999999999999', selector: '0xabcdef12' }, VENUES);
+  assert.equal(t.side, 'received');
+  assert.equal(t.why, 'no-known-venue');
+  assert.equal(t.token, MEME2);
+  assert.equal(t.amount, 1000n);
+  assert.equal(isRhTrade(t), false, 'an unrecognised arrival must never be copied');
+  ok('a token arriving with no known venue is received, not bought');
+}
+{
+  // Whitelist off = the old behaviour, unchanged. Opting in must be a choice.
+  const t = classifyRhTrade(arrival(), HIM2, undefined, { to: '0x9999999999999999999999999999999999999999', selector: '0xabcdef12' }, null);
+  assert.equal(t.side, 'buy', 'with no whitelist the classifier behaves exactly as before');
+  assert.equal(classifyRhTrade(arrival(), HIM2, undefined, null, new Set()).side, 'buy');
+  ok('an empty or absent whitelist changes nothing');
+}
+{
+  // The venue is matched case-insensitively — addresses arrive in both casings.
+  const receipt = arrival([{ address: ROUTER.toUpperCase().replace('0X', '0x'), topics: ['0x01'], data: '0x' }]);
+  const t = classifyRhTrade(receipt, HIM2, undefined, { to: ENTRYPOINT, selector: '0x01' }, VENUES);
+  assert.equal(t.side, 'buy');
+  ok('venue matching is case-insensitive');
+}
+{
+  // A transfer is refused BEFORE the whitelist is consulted: a direct transfer
+  // from a venue-adjacent contract is still not a purchase.
+  const t = classifyRhTrade(arrival([{ address: ROUTER, topics: ['0x01'], data: '0x' }]), HIM2, undefined, { to: MEME2, selector: '0xa9059cbb' }, VENUES);
+  assert.equal(t.side, 'transfer');
+  ok('the transfer rules still win over the whitelist');
+}
+{
+  assert.equal(venueTouched(arrival(), { to: ROUTER }, VENUES), ROUTER, 'the target counts as a venue');
+  assert.equal(venueTouched(arrival(), { to: ENTRYPOINT }, VENUES), null);
+  assert.equal(venueTouched(arrival(), null, null), null, 'no whitelist, no match');
+  ok('venueTouched checks the target and every log emitter');
 }
 
 console.log(`\n${pass} passed\n`);

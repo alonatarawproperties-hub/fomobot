@@ -104,7 +104,25 @@ export function erc20Deltas(receipt, owner) {
  *   funding     — only quote currency moved
  *   null        — nothing of ours moved, or the transaction failed
  */
-export function classifyRhTrade(receipt, owner, quoteTokens = QUOTE_TOKENS, call = null) {
+/**
+ * Did this transaction touch a contract we recognise as a trading venue?
+ *
+ * Checked against the transaction's target AND every log emitter, because a swap
+ * routed through a bundler has a target that is the entry point rather than the
+ * venue — but the venue still emits.
+ */
+export function venueTouched(receipt, call, venues) {
+  if (!venues?.size) return null;
+  const to = lower(call?.to);
+  if (to && venues.has(to)) return to;
+  for (const log of receipt?.logs ?? []) {
+    const addr = lower(log?.address);
+    if (addr && venues.has(addr)) return addr;
+  }
+  return null;
+}
+
+export function classifyRhTrade(receipt, owner, quoteTokens = QUOTE_TOKENS, call = null, venues = null) {
   // A reverted transaction moved nothing. `status` is '0x1' on success; treat
   // anything else, including a missing field, as not-a-trade rather than
   // assuming success on an incomplete receipt.
@@ -141,6 +159,40 @@ export function classifyRhTrade(receipt, owner, quoteTokens = QUOTE_TOKENS, call
         why: TRANSFER_SELECTORS.has(selector) ? 'transfer-selector' : 'target-is-the-token-itself',
       };
     }
+    // THE VENUE WHITELIST, when one is configured.
+    //
+    // Every rule above says what a purchase is NOT. This one says what it IS: a
+    // swap goes through a venue, and a token arriving without one was given, not
+    // bought — by an airdrop distributor, a vesting escrow, a rewards claim, a
+    // bridge. Those invoke a contract that is neither the token nor a venue, and
+    // nothing else catches them.
+    //
+    // THE COST IS REAL AND IS THE REASON THIS IS OPT-IN. fomo's router is
+    // proprietary and can be redeployed; the day it is, every real buy stops
+    // matching. So an unmatched arrival is NOT silently dropped — it returns
+    // `received`, which the caller alerts on loudly, because "the router moved"
+    // and "he was airdropped something" look identical here and only a human can
+    // tell them apart. Missing a buy while being told is survivable. Missing one
+    // in silence is not.
+    if (venues?.size) {
+      const venue = venueTouched(receipt, call, venues);
+      if (!venue) {
+        return {
+          side: 'received',
+          direction: subject.delta > 0n ? 'in' : 'out',
+          token: subject.token,
+          amount: subject.delta > 0n ? subject.delta : -subject.delta,
+          why: 'no-known-venue',
+        };
+      }
+      return {
+        side: subject.delta > 0n ? 'buy' : 'sell',
+        token: subject.token,
+        amount: subject.delta > 0n ? subject.delta : -subject.delta,
+        venue,
+      };
+    }
+
     return {
       side: subject.delta > 0n ? 'buy' : 'sell',
       token: subject.token,

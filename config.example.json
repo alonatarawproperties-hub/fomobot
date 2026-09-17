@@ -35,6 +35,8 @@
     "rpcUrl": "https://rpc.mainnet.chain.robinhood.com",
     "wallet": "0xYOUR_WALLET_ADDRESS",
     "quoteToken": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+    "_venues_comment": "Contracts that count as a TRADING VENUE. Empty means off, and off is the old behaviour: a token arriving reads as a buy unless a transfer rule refuses it. With a list, a purchase must go THROUGH one of these -- anything else that puts a token in the wallet (an airdrop, a vesting release, a rewards claim, a bridge) is reported as 'received' and NEVER copied. THE ADDRESSES ARE NOT SHIPPED HERE ON PURPOSE: fomo's router is proprietary and redeployable, and a stale one would stop copying real buys. Read them off a known-good buy with `npm run find-venues -- <txHash>`. When a token arrives outside the list the bot alerts LOUDLY, because 'he was airdropped something' and 'the router moved' look identical from here and only you can tell them apart.",
+    "venues": [],
     "sizeUsd": 25,
     "slippageBps": 300,
     "maxOutputDriftBps": 300,
