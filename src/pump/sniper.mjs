@@ -40,6 +40,21 @@ export const ATA_RENT_LAMPORTS = 2_039_280n;
 /** Solana's per-signature fee. One signature per transaction here. */
 export const SIGNATURE_FEE_LAMPORTS = 5_000n;
 
+/**
+ * How old a blockhash may be when we sign with it.
+ *
+ * Solana accepts a transaction for 150 slots after its blockhash — roughly 60
+ * seconds. Past that the cluster does not delay it, it REJECTS it, and a Jito
+ * bundle built from such transactions comes back `Invalid` having never
+ * executed. 30s leaves room for the bundle to reach a leader and still be
+ * inside the window.
+ *
+ * Measured the hard way: a run whose blockhash refresh had been failing for
+ * twelve minutes fired a bundle that five relays accepted and no leader could
+ * execute. Nothing in the fire path had checked how old the blockhash was.
+ */
+export const MAX_BLOCKHASH_AGE_MS = 30_000;
+
 export class PumpSniper extends EventEmitter {
   /**
    * @param {object} opts
@@ -96,6 +111,7 @@ export class PumpSniper extends EventEmitter {
     this.tipAccounts = [];
     this.blockhash = null;
     this.blockhashAt = 0;
+    this.blockhashFailures = 0;
     this.blockhashTimer = null;
     this.subscriptions = new Map(); // mint base58 -> subscription id (bonding curve)
     this.mintSubscriptions = new Map(); // mint base58 -> subscription id (mint account)
@@ -223,7 +239,27 @@ export class PumpSniper extends EventEmitter {
   startBlockhashRefresh(intervalMs = 2000) {
     if (this.blockhashTimer) return;
     this.blockhashTimer = setInterval(() => {
-      this.#refreshBlockhash().catch((err) => this.emit('warn', { at: 'blockhash', error: err.message }));
+      this.#refreshBlockhash()
+        .then(() => {
+          if (this.blockhashFailures > 0) {
+            this.emit('warn', { at: 'blockhash', recovered: true, afterFailures: this.blockhashFailures });
+            this.blockhashFailures = 0;
+          }
+        })
+        .catch((err) => {
+          this.blockhashFailures += 1;
+          const age = Date.now() - this.blockhashAt;
+          // One failed refresh is noise; a stale blockhash is a bot that cannot
+          // land anything. Escalate on AGE, not on the failure count, because
+          // that is what actually decides whether a bundle can execute.
+          this.emit(age > MAX_BLOCKHASH_AGE_MS ? 'stale' : 'warn', {
+            at: 'blockhash',
+            error: err.message,
+            failures: this.blockhashFailures,
+            ageMs: age,
+            canFire: age <= MAX_BLOCKHASH_AGE_MS,
+          });
+        });
     }, intervalMs);
     this.blockhashTimer.unref?.();
   }
@@ -246,6 +282,14 @@ export class PumpSniper extends EventEmitter {
    */
   buildBundle({ mint, curve, planned, tokenProgram }) {
     if (!this.blockhash) throw new Error('sniper: no blockhash in hand');
+    const age = Date.now() - this.blockhashAt;
+    if (age > MAX_BLOCKHASH_AGE_MS) {
+      throw new Error(
+        `sniper: the blockhash is ${Math.round(age / 1000)}s old and a transaction is only valid for about 60s. ` +
+        'Signing it would produce a bundle every relay accepts and no leader can execute. ' +
+        'The refresh must be failing — check connectivity to the RPC.',
+      );
+    }
     if (!tokenProgram) throw new Error('sniper: token program for the mint is unknown');
     const feeRecipient = this.#pick(this.global.feeRecipients);
     const buybackRecipient = this.#pick(this.buybackRecipients);
@@ -466,6 +510,14 @@ export class PumpSniper extends EventEmitter {
       })),
     });
 
+    // If the background refresh has fallen behind, try once more here rather
+    // than signing something that cannot land. This costs a round trip only in
+    // the case that would otherwise waste the whole launch.
+    if (Date.now() - this.blockhashAt > MAX_BLOCKHASH_AGE_MS) {
+      this.emit('warn', { at: 'blockhash', refreshingInFirePath: true, ageMs: Date.now() - this.blockhashAt });
+      await this.#refreshBlockhash().catch(() => {});
+    }
+
     const { tokenProgram, cached } = await this.#resolveTokenProgram(mint);
     const bundle = this.buildBundle({ mint, curve, planned, tokenProgram });
 
@@ -485,6 +537,7 @@ export class PumpSniper extends EventEmitter {
     this.emit('sent', {
       mint: key, slot: context?.slot ?? null,
       bundleId: result.bundleId, acceptedBy: result.acceptedBy,
+      blockhashAgeMs: Date.now() - this.blockhashAt,
       elapsedMs: Date.now() - seenAt,
     });
     return result;

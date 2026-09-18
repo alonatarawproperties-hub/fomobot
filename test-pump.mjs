@@ -26,7 +26,7 @@ import {
   MAX_BUNDLE_TRANSACTIONS,
 } from './src/pump/wallets.mjs';
 import { JitoClient, normaliseStatus, MAX_BUNDLE_SIZE } from './src/pump/jito.mjs';
-import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS } from './src/pump/sniper.mjs';
+import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS, MAX_BLOCKHASH_AGE_MS } from './src/pump/sniper.mjs';
 import { decideSnipeCommand, resolveTelegram } from './src/pump/snipe-control.mjs';
 
 let pass = 0;
@@ -578,6 +578,7 @@ function offlineSniper(overrides = {}) {
   s.buybackRecipients = [Keypair.generate().publicKey];
   s.tipAccounts = [Keypair.generate().publicKey.toBase58()];
   s.blockhash = { blockhash: '11111111111111111111111111111111', lastValidBlockHeight: 1 };
+  s.blockhashAt = Date.now();
   return s;
 }
 const CURVE = {
@@ -635,6 +636,29 @@ const CURVE = {
   s.blockhash = null;
   assert.throws(() => s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM }), /no blockhash/);
   ok('building without a blockhash in hand throws instead of signing something unlandable');
+}
+{
+  // The failure this exists to stop, reproduced from a real run: the refresh had
+  // been failing for twelve minutes, the bot signed with the blockhash it still
+  // held, five relays accepted the bundle and no leader could execute it. Jito
+  // reported it Invalid, landed_slot null, and not a lamport moved.
+  const s = offlineSniper();
+  s.blockhashAt = Date.now() - (MAX_BLOCKHASH_AGE_MS + 1000);
+  assert.throws(
+    () => s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM }),
+    /blockhash is \d+s old/,
+  );
+  ok('a blockhash past its shelf life refuses to build rather than signing a bundle nothing can execute');
+}
+{
+  const s = offlineSniper();
+  // Just inside the window still builds — the guard must not be so tight that a
+  // normal refresh interval trips it.
+  s.blockhashAt = Date.now() - (MAX_BLOCKHASH_AGE_MS - 5_000);
+  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
+  assert.equal(b.transactions.length, 5);
+  assert.ok(MAX_BLOCKHASH_AGE_MS < 60_000, 'the guard must be tighter than the cluster own expiry');
+  ok('a blockhash inside the window still builds, and the window is tighter than the cluster');
 }
 
 {

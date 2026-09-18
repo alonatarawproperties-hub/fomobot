@@ -114,6 +114,16 @@ async function main() {
     notify(`\u{1F4B8} <b>BUNDLE SENT</b>\n<code>${d.bundleId}</code>\n${d.acceptedBy?.length ?? 0} relay(s), ${d.elapsedMs}ms`);
   });
   sniper.on('warn', (d) => log('warn', 'warning', d));
+  // A stale blockhash is not a warning, it is a bot that cannot land anything.
+  // It must reach the phone, because from Telegram the bot looks armed and fine.
+  sniper.on('stale', (d) => {
+    log('error', 'BLOCKHASH STALE — cannot fire', d);
+    notify(
+      `\u{1F534} <b>CANNOT FIRE</b>\nThe blockhash is ${Math.round((d.ageMs ?? 0) / 1000)}s old after `
+      + `${d.failures} failed refreshes.\n\nA transaction is only valid ~60s, so a bundle built now would be `
+      + `accepted by the relays and executed by nobody. Check the RPC connection.`,
+    );
+  });
   sniper.on('error', (d) => { log('error', 'error', d); notify(`\u{1F534} Error: ${d.error}`); });
 
   await sniper.prime();
