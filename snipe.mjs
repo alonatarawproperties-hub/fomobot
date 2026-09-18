@@ -17,7 +17,7 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import { loadSniperWallets, auditSplit, solStringToLamports } from './src/solana/wallets.mjs';
 import { JitoClient } from './src/solana/jito.mjs';
 import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS } from './src/solana/sniper.mjs';
-import { decideSnipeCommand } from './src/solana/snipe-control.mjs';
+import { decideSnipeCommand, resolveTelegram } from './src/solana/snipe-control.mjs';
 import { startControl } from './src/control-io.mjs';
 
 const args = new Set(process.argv.slice(2));
@@ -163,10 +163,12 @@ async function main() {
     lastResult,
   });
 
-  if (telegram?.enabled && telegram.botToken && telegram.chatId) {
+  const tg = resolveTelegram({ config: telegram, env: process.env });
+
+  if (tg.on) {
     const control = startControl({
-      botToken: telegram.botToken,
-      chatId: telegram.chatId,
+      botToken: tg.botToken,
+      chatId: tg.chatId,
       snapshot,
       decide: decideSnipeCommand,
       log: (m, e) => log('info', `telegram: ${m}`, e),
@@ -216,7 +218,7 @@ async function main() {
       },
     });
     notify = (text) => control.send(text).catch(() => {});
-    log('info', 'telegram control plane up', { chatId: String(telegram.chatId) });
+    log('info', 'telegram control plane up', { chatId: tg.chatId, from: tg.source });
     await control.send(
       `\u{1F916} <b>Sniper up</b> · ${sniper.mode === 'live' ? '\u{1F4B8} LIVE' : '\u{1F4C4} PAPER'}\n\n`
       + `${wallets.length} wallets · ${SOL(split.buyTotal)} budget\n`
@@ -224,7 +226,7 @@ async function main() {
       + 'Send /target when you have the contract address, then /arm. /help for everything.',
     );
   } else {
-    log('warn', 'telegram is not configured — this bot can only be controlled from the shell');
+    log('warn', `telegram off (${tg.reason}) — this bot can only be controlled from the shell`);
   }
 
   const shutdown = async () => { await sniper.unwatch(); sniper.stopBlockhashRefresh(); process.exit(0); };

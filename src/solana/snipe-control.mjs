@@ -186,3 +186,35 @@ function planText(s) {
       : null,
   ].filter(Boolean).join('\n');
 }
+
+/**
+ * Work out which Telegram credentials to use, and whether to start at all.
+ *
+ * The bot token can arm live spending on this bot, so it belongs in the same
+ * root-only env file as the signing keys rather than in config.json. Env wins;
+ * the config fields remain a fallback so the copy-trader's existing convention
+ * keeps working unchanged.
+ *
+ * The placeholder check is not cosmetic. config.example.json ships
+ * PUT_A_SECOND_BOT_TOKEN_HERE, and a copied config with the placeholder left in
+ * would otherwise start a poll loop against a nonsense token — which Telegram
+ * refuses immediately rather than long-polling, so the loop spins. Treating an
+ * unfilled placeholder as "not configured" is the difference between a clear
+ * warning at boot and a bot that looks up but answers nothing.
+ */
+export function resolveTelegram({ config = {}, env = {} } = {}) {
+  const botToken = env.FIRSTFILL_SNIPER_TELEGRAM_TOKEN || config.botToken || '';
+  const chatId = env.FIRSTFILL_SNIPER_TELEGRAM_CHAT_ID || config.chatId || '';
+  const placeholder = (v) => String(v).startsWith('PUT_');
+  const source = env.FIRSTFILL_SNIPER_TELEGRAM_TOKEN ? 'env' : (config.botToken ? 'config' : 'none');
+
+  // `enabled` defaults to true when the token came from the environment: putting
+  // it there is already a deliberate act, and requiring a second opt-in in a
+  // different file is the kind of thing that is discovered at the wrong moment.
+  const enabled = config.enabled ?? Boolean(env.FIRSTFILL_SNIPER_TELEGRAM_TOKEN);
+
+  if (!enabled) return { on: false, reason: 'disabled in config', botToken: '', chatId: '', source };
+  if (!botToken || placeholder(botToken)) return { on: false, reason: 'no bot token', botToken: '', chatId: '', source };
+  if (!chatId || placeholder(chatId)) return { on: false, reason: 'no chat id', botToken: '', chatId: '', source };
+  return { on: true, reason: null, botToken, chatId: String(chatId), source };
+}

@@ -422,7 +422,7 @@ Needs Node 22+ (for the built-in WebSocket).
 ```sh
 npm install
 cp config.example.json config.json   # fill in Helius, Telegram, and the executor block
-npm test                             # 242 offline assertions, no network
+npm test                             # 247 offline assertions, no network
 npm run paper                        # detect + decide + simulate, sign nothing
 npm start
 ```
@@ -648,6 +648,25 @@ so any 32 bytes is valid and a mistyped CA is indistinguishable from a real one.
 What saves you is that a wrong address derives a bonding curve nothing will ever
 write, so the bot waits forever rather than buying the wrong token — a miss, not
 a loss. The bot says so every time you set a target.
+
+**Credentials live with the keys, not in the config.** The sniper reads
+`FIRSTFILL_SNIPER_TELEGRAM_TOKEN` and `FIRSTFILL_SNIPER_TELEGRAM_CHAT_ID` from
+the environment in preference to `telegram.botToken` / `telegram.chatId`, because
+this token can arm live spending and so belongs in the same root-only file as the
+signing keys. The config fields still work, so the copy-trader's convention is
+unchanged. A placeholder left unfilled counts as NOT configured rather than
+starting a poll loop against a nonsense token — Telegram refuses one of those
+immediately instead of long-polling, so the loop would spin.
+
+**Use a second bot, not the copy-trader's.** Telegram allows one `getUpdates`
+consumer per token, so pointing both bots at one token makes them fight over the
+poll; the loop detects the 409 and says so, but commands become unreliable.
+
+A bot only learns a chat id when someone messages it:
+
+```sh
+npm run chat-id      # message the bot first, then run this
+```
 
 **The bot token is the key to the wallets.** `/live` and `/arm` are both
 reachable from the phone, by deliberate choice, which means anyone who obtains

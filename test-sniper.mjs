@@ -27,7 +27,7 @@ import {
 } from './src/solana/wallets.mjs';
 import { JitoClient, normaliseStatus, MAX_BUNDLE_SIZE } from './src/solana/jito.mjs';
 import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS } from './src/solana/sniper.mjs';
-import { decideSnipeCommand } from './src/solana/snipe-control.mjs';
+import { decideSnipeCommand, resolveTelegram } from './src/solana/snipe-control.mjs';
 
 let pass = 0;
 const ok = (n) => { console.log(`  ok  ${n}`); pass++; };
@@ -760,6 +760,69 @@ const cmd = (line) => {
   assert.match(r.reply, /\/target/); // the help comes with it
   assert.match(decideSnipeCommand(cmd('/help'), snap()).reply, /\/abort/);
   ok('an unknown command is refused with the full command list attached');
+}
+
+{
+  // Env beats config, because the token can arm live spending and therefore
+  // belongs in the same root-only file as the signing keys.
+  const r = resolveTelegram({
+    config: { enabled: true, botToken: 'from-config', chatId: '111' },
+    env: { FIRSTFILL_SNIPER_TELEGRAM_TOKEN: 'from-env', FIRSTFILL_SNIPER_TELEGRAM_CHAT_ID: '222' },
+  });
+  assert.equal(r.on, true);
+  assert.equal(r.botToken, 'from-env');
+  assert.equal(r.chatId, '222');
+  assert.equal(r.source, 'env');
+  ok('a token in the environment overrides one in the config file');
+}
+{
+  const r = resolveTelegram({ config: { enabled: true, botToken: 't', chatId: 999 }, env: {} });
+  assert.equal(r.on, true);
+  assert.equal(r.source, 'config');
+  // Chat ids exceed what a JS number holds exactly, and the auth check compares
+  // strings — so this must come back as a string or the comparison silently fails.
+  assert.equal(r.chatId, '999');
+  assert.equal(typeof r.chatId, 'string');
+  ok('the chat id comes back as a string, which is what the auth check compares');
+}
+{
+  // The exact failure this prevents: a copied config.example.json whose
+  // placeholders were never filled in. Telegram refuses a nonsense token
+  // immediately instead of long-polling, so the loop would spin.
+  const ph = resolveTelegram({ config: { enabled: true, botToken: 'PUT_A_SECOND_BOT_TOKEN_HERE', chatId: 'PUT_CHAT_ID_HERE' }, env: {} });
+  assert.equal(ph.on, false);
+  assert.equal(ph.reason, 'no bot token');
+  const halfPh = resolveTelegram({ config: { enabled: true, botToken: 'real', chatId: 'PUT_CHAT_ID_HERE' }, env: {} });
+  assert.equal(halfPh.on, false);
+  assert.equal(halfPh.reason, 'no chat id');
+  ok('an unfilled placeholder counts as not configured, rather than spinning the poll loop');
+}
+{
+  assert.equal(resolveTelegram({ config: { enabled: false, botToken: 't', chatId: '1' }, env: {} }).on, false);
+  assert.equal(resolveTelegram({ config: {}, env: {} }).on, false);
+  // A token placed in the environment is already a deliberate act; requiring a
+  // second opt-in in another file is discovered at the wrong moment.
+  const envOnly = resolveTelegram({ config: {}, env: { FIRSTFILL_SNIPER_TELEGRAM_TOKEN: 't', FIRSTFILL_SNIPER_TELEGRAM_CHAT_ID: '5' } });
+  assert.equal(envOnly.on, true);
+  // But an explicit false in config still wins — it is an explicit instruction.
+  const off = resolveTelegram({ config: { enabled: false }, env: { FIRSTFILL_SNIPER_TELEGRAM_TOKEN: 't', FIRSTFILL_SNIPER_TELEGRAM_CHAT_ID: '5' } });
+  assert.equal(off.on, false);
+  ok('env credentials self-enable, but an explicit enabled:false still wins');
+}
+{
+  const r = resolveTelegram({ config: { enabled: true, botToken: 't', chatId: '1' }, env: {} });
+  // Never hand back a credential on a path that decided not to start.
+  const offPaths = [
+    resolveTelegram({ config: { enabled: false, botToken: 'secret', chatId: '1' }, env: {} }),
+    resolveTelegram({ config: { enabled: true, botToken: 'secret', chatId: '' }, env: {} }),
+  ];
+  for (const o of offPaths) {
+    assert.equal(o.on, false);
+    assert.equal(o.botToken, '');
+    assert.equal(o.chatId, '');
+  }
+  assert.equal(r.on, true);
+  ok('a refused configuration returns empty credentials, not the ones it rejected');
 }
 
 console.log(`\n${pass} passed\n`);
