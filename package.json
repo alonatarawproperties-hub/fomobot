@@ -24,7 +24,8 @@
     "find-venues": "node scripts/find-venues.mjs",
     "snipe-pump": "node snipe-pump.mjs",
     "snipe-pump:live": "node snipe-pump.mjs --live",
-    "chat-id": "node scripts/telegram-chat-id.mjs"
+    "chat-id": "node scripts/telegram-chat-id.mjs",
+    "snipe-pump:rehearse": "node snipe-pump.mjs --live --rehearse"
   },
   "dependencies": {
     "@solana/web3.js": "^1.99.0",

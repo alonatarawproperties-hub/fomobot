@@ -22,6 +22,7 @@ import { startControl } from './src/control-io.mjs';
 
 const args = new Set(process.argv.slice(2));
 const START_LIVE = args.has('--live');
+const REHEARSE = args.has('--rehearse');
 
 const SOL = (l) => `${(Number(l) / 1e9).toFixed(9).replace(/0+$/, '').replace(/\.$/, '') || '0'} SOL`;
 const log = (level, msg, extra) =>
@@ -62,6 +63,10 @@ async function main() {
   });
 
   console.log(`\n  mode          ${START_LIVE ? 'LIVE — this will spend real SOL' : 'PAPER — nothing signed or sent'}`);
+  if (REHEARSE) {
+    console.log('  REHEARSAL     buying 1 raw token unit per wallet, 0.001 SOL tip');
+    console.log('                structurally identical bundle, ~0.0017 SOL unrecoverable');
+  }
   console.log(`  wallets       ${wallets.length}`);
   console.log(`  target        ${(cfg.mints ?? [])[0] ?? '(none — set it with /target over Telegram)'}`);
   console.log(`  budget        ${SOL(split.buyTotal)} across buys, ${SOL(split.overhead)} overhead`);
@@ -90,6 +95,7 @@ async function main() {
     computeUnitPriceMicroLamports: cfg.computeUnitPriceMicroLamports ?? 500_000,
     maxPreBuyLamports,
     paper: !START_LIVE,
+    rehearse: REHEARSE,
   });
 
   const startedAt = Date.now();
@@ -108,6 +114,22 @@ async function main() {
     log('info', 'paper bundle built, not sent', d);
     notify(`\u{1F4C4} <b>Paper</b> — built ${d.transactions} transactions in ${d.elapsedMs}ms. Nothing sent.`);
   });
+  // Accepted by relays is NOT landed. This is the event that says which.
+  sniper.on('settled', (d) => {
+    const line = d.verdict === 'landed'
+      ? `\u2705 <b>LANDED</b> in slot ${d.landedSlot}`
+      : d.verdict === 'dropped-before-auction'
+        ? '\u{1F534} <b>DROPPED BEFORE THE AUCTION</b>\nIt never reached Pending — the block engine '
+          + 'discarded it rather than losing a race. Submission path, not competition.'
+        : '\u{1F7E0} <b>FORWARDED THEN LOST</b>\nIt reached Pending and did not land — it was in the '
+          + 'auction and lost, or reverted. Raise the tip or fix the revert.';
+    log(d.verdict === 'landed' ? 'signal' : 'error', `bundle ${d.verdict}`, {
+      bundleId: d.bundleId, everPending: d.everPending, samples: d.samples?.length,
+      raw: d.samples?.map((x) => x.raw ?? x.error).join(' -> '),
+    });
+    notify(`${line}\n\n<code>${d.bundleId}</code>\nstatus trail: ${d.samples?.map((x) => x.raw ?? 'err').join(' \u2192 ') || '(none)'}`);
+  });
+
   sniper.on('sent', (d) => {
     lastResult = `bundle ${d.bundleId?.slice(0, 12)} sent in ${d.elapsedMs}ms`;
     log('signal', 'BUNDLE SENT', d);

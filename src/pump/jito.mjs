@@ -63,10 +63,25 @@ export class JitoClient {
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
-    const body = await res.json();
+    // Read as text first. A 429 or a 5xx returns HTML or a bare string, and
+    // res.json() on that throws a SyntaxError that reads like a network fault —
+    // which is how a rate limit spent this long looking like a connectivity problem.
+    const text = await res.text();
+    let body;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      throw new Error(`jito ${method} @ ${baseUrl}: HTTP ${res.status} ${text.slice(0, 200)}`);
+    }
     if (body.error) {
       const msg = body.error.message ?? JSON.stringify(body.error);
-      throw new Error(`jito ${method} @ ${baseUrl}: ${msg}`);
+      // Ingress rejections are NAMED and arrive as HTTP 400: a bad signature, a
+      // missing tip, too many transactions, undecodable bytes. Those are worth
+      // telling apart from the limiter, which is retryable.
+      const err = new Error(`jito ${method} @ ${baseUrl}: ${msg}`);
+      if (body.error.code === -32097 || /rate.?limit/i.test(msg)) err.rateLimited = true;
+      if (res.status === 400) err.rejectedAtIngress = true;
+      throw err;
     }
     return body.result;
   }
@@ -131,35 +146,80 @@ export class JitoClient {
     throw new Error(`jito: all ${this.relays.length} relays refused the bundle — ${errors[0]}`);
   }
 
-  /** Ask the relays what became of a bundle. */
-  async getBundleStatus(bundleId) {
-    for (const relay of this.relays) {
+  /**
+   * Poll a bundle to a terminal state, recording every sample.
+   *
+   * The ONLY question worth asking about a bundle that did not land is whether
+   * it ever reached Pending, because that splits the two causes that look
+   * identical from the outside:
+   *
+   *   never Pending, straight to Invalid  -> the engine dropped it before the
+   *                                          auction; it was never in the running
+   *   Pending, then Failed/Invalid        -> it was forwarded and then lost or reverted
+   *
+   * A single status check cannot tell those apart, and a single check is all
+   * this client used to do. It returned on the first relay that answered, and
+   * since the inflight endpoint answers for ANY well-formed id, the historical
+   * endpoint below it was unreachable.
+   *
+   * Relays are polled round-robin with exponential backoff. The limiter is one
+   * request per second PER REGION and getInflightBundleStatuses shares a bucket
+   * with sendBundle — so polling the region we just sent to, within a second,
+   * locks us out of the only endpoint that can answer.
+   */
+  async pollBundle(bundleId, { forMs = 40_000, onSample = () => {} } = {}) {
+    const startedAt = Date.now();
+    const samples = [];
+    let attempt = 0;
+    let delay = 1000;
+
+    while (Date.now() - startedAt < forMs) {
+      const relay = this.relays[attempt % this.relays.length];
+      attempt += 1;
       try {
         const r = await this.#rpc(relay, 'getInflightBundleStatuses', [[bundleId]]);
         const entry = r?.value?.[0];
-        if (entry) return { status: normaliseStatus(entry.status), slot: entry.landed_slot ?? null, relay };
-      } catch {
-        // fall through
-      }
-    }
-    for (const relay of this.relays) {
-      try {
-        const r = await this.#rpc(relay, 'getBundleStatuses', [[bundleId]]);
-        const entry = r?.value?.[0];
-        if (entry) {
-          return {
-            status: normaliseStatus(entry.confirmation_status),
-            slot: entry.slot ?? null,
-            error: entry.err ? JSON.stringify(entry.err) : null,
-            relay,
-          };
+        const sample = {
+          tMs: Date.now() - startedAt,
+          relay,
+          // The RAW string, never the normalised one. Normalising here would
+          // throw away the distinction this whole method exists to capture.
+          raw: entry?.status ?? null,
+          landedSlot: entry?.landed_slot ?? null,
+        };
+        samples.push(sample);
+        onSample(sample);
+        if (sample.raw === 'Landed' || sample.raw === 'Failed') {
+          return this.#settle(samples, sample, startedAt);
         }
-      } catch {
-        // fall through
+      } catch (err) {
+        samples.push({
+          tMs: Date.now() - startedAt, relay,
+          error: err.message, rateLimited: !!err.rateLimited,
+        });
       }
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 1.78, 30_000);
     }
-    // Not indexed yet is not the same as failed, and must not be reported as one.
-    return { status: 'pending', slot: null, relay: null };
+    return this.#settle(samples, samples.filter((x) => x.raw).at(-1) ?? null, startedAt);
+  }
+
+  #settle(samples, final, startedAt) {
+    const everPending = samples.some((x) => x.raw === 'Pending' || x.raw === 'InFlight');
+    return {
+      samples,
+      final,
+      everPending,
+      status: final ? normaliseStatus(final.raw) : 'unknown',
+      landedSlot: final?.landedSlot ?? null,
+      elapsedMs: Date.now() - startedAt,
+      // The verdict, stated rather than left to be inferred from the samples.
+      verdict: final?.raw === 'Landed'
+        ? 'landed'
+        : everPending
+          ? 'forwarded-then-lost'
+          : 'dropped-before-auction',
+    };
   }
 }
 
@@ -184,6 +244,12 @@ export function normaliseStatus(raw) {
     case 'Failed':
     case 'Dropped':
       return 'failed';
+    case 'Invalid':
+      // NOT a rejection. Jito means "I have no record of this bundle id", which
+      // is what you get both for a bundle that was dropped before the auction
+      // and for one that never existed. Mapping it to 'unknown' hid the single
+      // most important signal this client produces.
+      return 'invalid';
     default:
       return 'unknown';
   }

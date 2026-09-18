@@ -40,6 +40,10 @@ export const ATA_RENT_LAMPORTS = 2_039_280n;
 /** Solana's per-signature fee. One signature per transaction here. */
 export const SIGNATURE_FEE_LAMPORTS = 5_000n;
 
+/** Dust-rehearsal caps. Structurally identical bundle, negligible size. */
+export const REHEARSAL_MAX_SOL_COST = 1_000_000n;   // 0.001 SOL
+export const REHEARSAL_TIP_LAMPORTS = 1_000_000n;   // 0.001 SOL
+
 /**
  * How old a blockhash may be when we sign with it.
  *
@@ -76,7 +80,7 @@ export class PumpSniper extends EventEmitter {
       connection, jito, wallets,
       slippageBps, tipLamports, mints = [], tipWalletIndex = wallets.length - 1,
       computeUnitLimit = 250_000, computeUnitPriceMicroLamports = 500_000,
-      maxPreBuyLamports = 0n, paper = true,
+      maxPreBuyLamports = 0n, paper = true, rehearse = false,
     } = opts;
 
     if (!connection) throw new Error('sniper: connection is required');
@@ -105,6 +109,17 @@ export class PumpSniper extends EventEmitter {
     this.computeUnitPriceMicroLamports = computeUnitPriceMicroLamports;
     this.maxPreBuyLamports = maxPreBuyLamports;
     this.paper = paper;
+    /**
+     * Dust rehearsal. Fires the REAL path — same five transactions, same five
+     * fee payers, same 18-account buy, same ATA create, same tip placement, same
+     * single atomic bundle — but asks for one raw token unit instead of a real
+     * size. pump.fun's buy takes the exact token amount out, so one unit costs
+     * essentially nothing while remaining structurally identical.
+     *
+     * The point is to learn whether the bundle reaches the auction at all
+     * without putting half a SOL behind the question.
+     */
+    this.rehearse = rehearse;
 
     this.global = null;
     this.buybackRecipients = [];
@@ -211,7 +226,11 @@ export class PumpSniper extends EventEmitter {
     for (let i = 0; i < this.wallets.length; i++) {
       const w = this.wallets[i];
       const balance = BigInt(infos[i]?.lamports ?? 0);
-      let required = w.budgetLamports + ATA_RENT_LAMPORTS + SIGNATURE_FEE_LAMPORTS;
+      // The priority fee is real lamports and was missing from this sum. At
+      // 250k CU and 500k microLamports/CU it is 125,000 lamports per wallet —
+      // small, but a wallet that passes this check and then cannot pay fails its
+      // leg, and one failed leg voids the bundle for all five.
+      let required = w.budgetLamports + ATA_RENT_LAMPORTS + SIGNATURE_FEE_LAMPORTS + this.priorityFeeLamports();
       if (i === this.tipWalletIndex) required += this.tipLamports;
       report.push({
         address: w.address, balance, required, sufficient: balance >= required,
@@ -219,6 +238,11 @@ export class PumpSniper extends EventEmitter {
       });
     }
     return report;
+  }
+
+  /** What the compute budget instructions will actually cost, in lamports. */
+  priorityFeeLamports() {
+    return (BigInt(this.computeUnitLimit) * BigInt(this.computeUnitPriceMicroLamports)) / 1_000_000n;
   }
 
   async #refreshBlockhash() {
@@ -308,8 +332,10 @@ export class PumpSniper extends EventEmitter {
           mint,
           buyer,
           creator: curve.creator,
-          amountTokens: leg.requestTokens,
-          maxSolCost: leg.maxSolCost,
+          // One raw token unit, capped at 0.001 SOL. Everything else about the
+          // transaction is untouched, so what is tested is the submission path.
+          amountTokens: this.rehearse ? 1n : leg.requestTokens,
+          maxSolCost: this.rehearse ? REHEARSAL_MAX_SOL_COST : leg.maxSolCost,
           feeRecipient,
           buybackRecipient,
           tokenProgram,
@@ -322,7 +348,7 @@ export class PumpSniper extends EventEmitter {
         instructions.push(SystemProgram.transfer({
           fromPubkey: buyer,
           toPubkey: new PublicKey(this.#pick(this.tipAccounts)),
-          lamports: Number(this.tipLamports),
+          lamports: Number(this.rehearse ? REHEARSAL_TIP_LAMPORTS : this.tipLamports),
         }));
       }
 
@@ -539,7 +565,17 @@ export class PumpSniper extends EventEmitter {
       bundleId: result.bundleId, acceptedBy: result.acceptedBy,
       blockhashAgeMs: Date.now() - this.blockhashAt,
       elapsedMs: Date.now() - seenAt,
+      rehearsal: this.rehearse,
     });
+
+    // Accepted is not landed. Until this existed, the bot reported a bundle id
+    // and stopped, and every failure looked exactly like a success. Polling is
+    // what distinguishes a bundle dropped before the auction from one that was
+    // forwarded and lost — and that distinction is the whole diagnosis.
+    this.jito.pollBundle(result.bundleId)
+      .then((settled) => this.emit('settled', { mint: key, bundleId: result.bundleId, ...settled }))
+      .catch((err) => this.emit('warn', { at: 'pollBundle', error: err?.message ?? String(err) }));
+
     return result;
   }
 

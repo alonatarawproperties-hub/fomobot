@@ -26,7 +26,8 @@ import {
   MAX_BUNDLE_TRANSACTIONS,
 } from './src/pump/wallets.mjs';
 import { JitoClient, normaliseStatus, MAX_BUNDLE_SIZE } from './src/pump/jito.mjs';
-import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS, MAX_BLOCKHASH_AGE_MS } from './src/pump/sniper.mjs';
+import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS, MAX_BLOCKHASH_AGE_MS,
+         REHEARSAL_MAX_SOL_COST, REHEARSAL_TIP_LAMPORTS } from './src/pump/sniper.mjs';
 import { decideSnipeCommand, resolveTelegram } from './src/pump/snipe-control.mjs';
 
 let pass = 0;
@@ -416,8 +417,8 @@ console.log('\njito bundling');
   const calls = [];
   const fetchImpl = async (url, init) => {
     calls.push(url);
-    if (url.includes('frankfurt')) return { json: async () => ({ result: 'BUNDLE123' }) };
-    return { json: async () => ({ error: { message: 'relay down' } }) };
+    if (url.includes('frankfurt')) return { ok: true, status: 200, text: async () => JSON.stringify({ result: 'BUNDLE123' }) };
+    return { ok: true, status: 200, text: async () => JSON.stringify({ error: { message: 'relay down' } }) };
   };
   const j = new JitoClient({ relays: ['https://a.example', 'https://frankfurt.example'], fetchImpl });
   const r = await j.sendBundle(['tx1', 'tx2']);
@@ -429,10 +430,31 @@ console.log('\njito bundling');
 {
   const j = new JitoClient({
     relays: ['https://a.example'],
-    fetchImpl: async () => ({ json: async () => ({ error: { message: 'nope' } }) }),
+    fetchImpl: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ error: { message: 'nope' } }) }),
   });
   await assert.rejects(j.sendBundle(['tx']), /all 1 relays refused/);
   ok('a bundle no relay accepted throws rather than reporting a send');
+}
+{
+  // An HTTP error must not surface as a JSON parse failure — that is how a rate
+  // limit spent an afternoon looking like a connectivity problem.
+  const j = new JitoClient({
+    relays: ['https://a.example'],
+    fetchImpl: async () => ({ ok: false, status: 429, text: async () => '<html>Too Many Requests</html>' }),
+  });
+  await assert.rejects(j.sendBundle(['tx']), /HTTP 429/);
+  ok('an HTML error page is reported as its HTTP status, not as a parse error');
+}
+{
+  const j = new JitoClient({
+    relays: ['https://a.example'],
+    fetchImpl: async () => ({ ok: false, status: 400, text: async () => JSON.stringify({
+      error: { message: 'Bundles must write lock at least one tip account to be eligible for the auction.' } }) }),
+  });
+  // Ingress rejections are NAMED and arrive as 400. Getting one back is good
+  // news: it says exactly what is wrong, unlike a 200 followed by Invalid.
+  await assert.rejects(j.sendBundle(['tx']), /write lock at least one tip account/);
+  ok('a named ingress rejection is passed through verbatim rather than flattened');
 }
 {
   assert.equal(normaliseStatus('Landed'), 'landed');
@@ -442,7 +464,10 @@ console.log('\njito bundling');
   // The important one: anything we do not recognise must NOT read as landed.
   assert.equal(normaliseStatus('SomethingNew'), 'unknown');
   assert.equal(normaliseStatus(undefined), 'unknown');
-  ok('an unrecognised bundle status reads as unknown, never as landed');
+  // Invalid used to fall through to 'unknown', which hid the single most
+  // important signal the block engine produces.
+  assert.equal(normaliseStatus('Invalid'), 'invalid');
+  ok('an unrecognised bundle status reads as unknown, and Invalid reads as invalid');
 }
 
 console.log('\nthe fire gate');
@@ -702,6 +727,51 @@ const CURVE = {
   assert.ok(keysOf(b.transactions[0]).includes(TOKEN_2022_PROGRAM.toBase58()));
   assert.notDeepEqual(keysOf(a.transactions[0]), keysOf(b.transactions[0]));
   ok('the resolved token program reaches the built transaction and changes its accounts');
+}
+
+{
+  const s = offlineSniper();
+  // 250_000 CU x 500_000 microLamports/CU = 125_000 lamports. Omitting this from
+  // the balance check lets a wallet pass and then fail its leg, which voids the
+  // whole bundle because it is atomic.
+  assert.equal(s.priorityFeeLamports(), 125_000n);
+  ok('the priority fee is computed from the compute budget rather than ignored');
+}
+{
+  const plain = offlineSniper();
+  const dust = offlineSniper({ rehearse: true });
+  const planned = plain.plan(CURVE);
+  const a = plain.buildBundle({ mint: plain.mints[0], curve: CURVE, planned, tokenProgram: TOKEN_PROGRAM });
+  const b = dust.buildBundle({ mint: dust.mints[0], curve: CURVE, planned, tokenProgram: TOKEN_PROGRAM });
+
+  // Structurally identical: same count, same instruction counts, same order.
+  assert.equal(a.transactions.length, b.transactions.length);
+  const ixCounts = (bundle) => bundle.transactions.map((t) =>
+    VersionedTransaction.deserialize(Buffer.from(t, 'base64')).message.compiledInstructions.length);
+  assert.deepEqual(ixCounts(a), ixCounts(b));
+  ok('a rehearsal bundle has the same shape as the real one — it tests the same path');
+}
+{
+  const dust = offlineSniper({ rehearse: true });
+  const b = dust.buildBundle({ mint: dust.mints[0], curve: CURVE, planned: dust.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
+  // The buy is the 4th instruction; its data is discriminator + amount + cap.
+  const tx = VersionedTransaction.deserialize(Buffer.from(b.transactions[0], 'base64'));
+  const buyIx = tx.message.compiledInstructions[3];
+  const data = Buffer.from(buyIx.data);
+  assert.equal(data.readBigUInt64LE(8), 1n);                       // one raw token unit
+  assert.equal(data.readBigUInt64LE(16), REHEARSAL_MAX_SOL_COST);  // capped at 0.001 SOL
+  assert.ok(REHEARSAL_TIP_LAMPORTS < 5_000_000n);
+  ok('a rehearsal asks for one raw token unit under a 0.001 SOL cap, so it costs almost nothing');
+}
+{
+  const plain = offlineSniper();
+  const b = plain.buildBundle({ mint: plain.mints[0], curve: CURVE, planned: plain.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
+  const tx = VersionedTransaction.deserialize(Buffer.from(b.transactions[0], 'base64'));
+  const data = Buffer.from(tx.message.compiledInstructions[3].data);
+  // And the real path must be untouched by the rehearsal plumbing.
+  assert.notEqual(data.readBigUInt64LE(8), 1n);
+  assert.equal(data.readBigUInt64LE(16), 2_600_000_000n);
+  ok('the real path still asks for the planned size — rehearsal plumbing does not leak into it');
 }
 
 console.log('\ntelegram control');
