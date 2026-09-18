@@ -42,5 +42,43 @@
     "dailyLossLimitUsd": 100,
     "cooldownMs": 60000,
     "denylistTokens": []
+  },
+  "sniper": {
+    "_comment": "pump.fun launch sniper, driven by `npm run snipe`. Five wallets buy one launch in a single Jito bundle. THE KEYS ARE NEVER IN THIS FILE - wallet N reads FIRSTFILL_SNIPER_KEY_N from the environment, and a key found here is a startup failure. Paper is the default and --live is the ONLY way to arm signing; there is deliberately no config flag for it. totalSol is what you are declaring you will risk, and startup refuses if the per-wallet amounts plus tip, rent and fees exceed it.",
+    "rpcUrl": "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
+    "wsUrl": "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
+    "totalSol": "10",
+    "mints": [
+      "PUT_THE_CONTRACT_ADDRESS_HERE"
+    ],
+    "wallets": [
+      {
+        "address": "PUT_WALLET_1_ADDRESS",
+        "sol": "2.6"
+      },
+      {
+        "address": "PUT_WALLET_2_ADDRESS",
+        "sol": "1.35"
+      },
+      {
+        "address": "PUT_WALLET_3_ADDRESS",
+        "sol": "2.15"
+      },
+      {
+        "address": "PUT_WALLET_4_ADDRESS",
+        "sol": "1.05"
+      },
+      {
+        "address": "PUT_WALLET_5_ADDRESS",
+        "sol": "2.4"
+      }
+    ],
+    "slippageBps": 500,
+    "jitoTipSol": "0.005",
+    "tipWalletIndex": 4,
+    "maxPreBuySol": "0.5",
+    "computeUnitLimit": 250000,
+    "computeUnitPriceMicroLamports": 500000,
+    "blockhashRefreshMs": 2000
   }
 }

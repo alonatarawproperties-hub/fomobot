@@ -422,7 +422,7 @@ Needs Node 22+ (for the built-in WebSocket).
 ```sh
 npm install
 cp config.example.json config.json   # fill in Helius, Telegram, and the executor block
-npm test                             # 183 offline assertions, no network
+npm test                             # 227 offline assertions, no network
 npm run paper                        # detect + decide + simulate, sign nothing
 npm start
 ```
@@ -477,6 +477,148 @@ what the recorded entries are for, and it is what should decide sizing.
 
 ---
 
+## The pump.fun sniper
+
+A second, separate bot: `npm run snipe`. Five wallets buy one pump.fun launch in
+a single Jito bundle, at contract addresses known in advance. It shares nothing
+with the copy-trader but the repo — different entrypoint, different config block,
+different keys — because a config that can arm five funded wallets should not be
+the same file that turns on a watcher.
+
+```
+config CAs  ->  derive bonding curve PDA  ->  accountSubscribe (processed)
+                                                      |
+                                       the curve account is created
+                                                      |
+                              decode -> re-plan -> build -> sign -> one bundle
+```
+
+### Knowing the address in advance removes the entire discovery step
+
+The usual shape is: watch the program's logs, see a create, fetch the transaction
+back to learn which mint it was, then quote it. That is two network round trips
+spent learning something we were already told. None of them are here. A bonding
+curve's address is `findProgramAddress(["bonding-curve", mint])` — a pure
+function of the mint that does not need the account to exist — so we subscribe to
+the exact address before the launch and are handed the account data in the
+notification that announces it. **Nothing is fetched between the launch and the
+bundle.** Measured: 45.7ms to build and sign all five transactions.
+
+### Everything here was read off the chain, not off a blog
+
+Every constant was verified against mainnet on 2026-09-18 before a line was
+written, and two widely-copied values were wrong:
+
+| | claimed | actual |
+|---|---|---|
+| fee | 100 bps | **95 bps**, read from Global at byte 105 |
+| rounding | floor the output | **ceil the new reserve** — differs by one raw unit |
+
+The fee is read from the chain at boot rather than hardcoded at all. The
+initial reserves (`30 SOL` / `1.073e15` tokens) likewise come from the Global
+account, which is what makes the pre-launch plan possible.
+
+### `buy` does not take a minimum out, and this is where snipers die
+
+pump.fun's buy is `(amount, max_sol_cost)` where **`amount` is the exact number
+of tokens you receive** and `max_sol_cost` caps the SOL. It is not a minOut, and
+the orientation is the reverse of every EVM router. Verified by decoding real
+buys: tokens received `=== amount`, exactly, every time.
+
+So `minTokens = 1` — which is what a sniper reaching for "accept any fill"
+naturally writes — does not mean "accept any fill". It means **buy one raw token
+unit**, 0.000001 of a token, and spend nothing. A bot written that way does not
+fill badly; it does not fill at all.
+
+Our protection runs the other way round: `max_sol_cost` is the wallet's budget,
+full stop, and `slippageBps` shaves the *token amount requested* to leave
+headroom. If someone lands ahead of us the price rises, our fixed request costs
+more SOL, and the cap absorbs it up to the shave. Past that the bundle reverts
+and nothing is spent — a miss, not a loss. **No wallet can spend more than its
+configured budget, whatever the RPC says**, which is what bounds the damage if
+the curve data we are handed is wrong or hostile.
+
+### Five buys in one bundle move the curve against each other
+
+A Jito bundle executes its transactions in order, atomically, in one slot. That
+is what makes five wallets land together — and it is also all-or-nothing, so one
+reverting leg voids the other four fills.
+
+Which means each leg has to be priced against the curve **the leg before it
+leaves behind**, not against the pre-launch state. Quoting all five against the
+fresh curve makes the last wallet ask for more tokens than the curve can then
+give at its cap; it reverts, and takes everyone with it. The ladder in
+`planLadder` walks the constant product forward across the five buys.
+
+The cost of this is real and it is not a bug. Against a fresh curve with 9.55 SOL
+split across five wallets:
+
+```
+  w1   2.6  SOL  ->  84,835,031,144,871 tokens   @ 3.0359e-5
+  w2   1.35 SOL  ->  38,966,633,769,213          @ 3.4319e-5
+  w3   2.15 SOL  ->  56,088,399,617,717          @ 3.7972e-5
+  w4   1.05 SOL  ->  25,050,499,042,606          @ 4.1521e-5
+  w5   2.4  SOL  ->  52,299,300,791,530          @ 4.5458e-5
+```
+
+**The last wallet pays 49.73% more per token than the first.** You are buying
+from yourself, four times. That is the price of the split and it is printed at
+startup so it is never a surprise. It scales with how much of the curve you take:
+9.55 SOL against a 30 SOL virtual reserve is about a third of it.
+
+Also worth being clear-eyed about: one bundle is the most *obvious* way to do
+this. Five buys in consecutive positions of one bundle in one slot is a pattern
+anyone reading the block can see. What the uneven split buys you is that the
+wallets do not look like one script with one number in it — not concealment of
+the bundle itself.
+
+### Keys, and the one mistake that does not announce itself
+
+Wallet N reads `FIRSTFILL_SNIPER_KEY_N` and nothing else. A key in `config.json`
+is a startup failure. Every key is checked against the address written in the
+config, because a mistyped address does not throw on its own — it would plan
+against one wallet and sign with another, silently, forever. A duplicate wallet
+is refused, and so is a 32-byte seed pasted where the 64-byte secret key belongs
+(both are plausible pastes and they produce different addresses, so guessing
+which was meant is exactly the class of error this is here to stop).
+
+```sh
+sudo install -m 600 /dev/null /etc/firstfill-sniper.env
+sudo tee /etc/firstfill-sniper.env >/dev/null <<'ENV'
+FIRSTFILL_SNIPER_KEY_1=...
+FIRSTFILL_SNIPER_KEY_5=...
+ENV
+```
+
+### Arming it
+
+`npm run snipe` is paper: it primes from the chain, prints the full ladder,
+checks every balance, subscribes, and signs nothing. **There is no config flag
+for live mode** — `npm run snipe:live` is the only way, deliberately, every time.
+
+Startup refuses if the per-wallet amounts plus tip, rent and signature fees
+exceed `totalSol`. The buys are not the whole cost: each wallet pays
+0.00203928 SOL of token-account rent and a 5,000-lamport signature, and one pays
+the Jito tip. A split summing to exactly 10 SOL leaves nothing for any of it, and
+the shortfall would not surface as a warning — the underfunded leg fails and the
+bundle is atomic, so it takes the other four fills with it.
+
+### Known limits — read these before arming it
+
+- **There is no exit.** Same as the copy-trader: it buys and holds. Selling is
+  manual. `max_sol_cost` bounds what you can spend, not what the position is
+  worth afterwards.
+- **A launch that never happens leaves it armed indefinitely.** There is no
+  timeout; the process waits until you stop it.
+- **`maxPreBuySol` refuses a curve somebody already moved**, but it cannot tell
+  a friendly first buy from a hostile one.
+- **Jito bundles cap at five transactions**, which is why five wallets is the
+  ceiling and not a preference. A sixth wallet is refused at startup.
+- **The tip is not adaptive.** It is a fixed number from the config, not bid
+  against the current tip floor, so a contested launch can out-tip it.
+- **Only the bonding curve is handled.** A mint that has already graduated to
+  PumpSwap is refused rather than routed.
+
 ## Files that need their test run before you change them
 
 Each has a dedicated offline regression suite. Run it before and after.
@@ -490,6 +632,7 @@ Each has a dedicated offline regression suite. Run it before and after.
 | `src/aggregator.mjs` | `node test-aggregator.mjs` |
 | `src/executor.mjs`, `src/executor-io.mjs`, the wiring in `index.mjs` | `node test-executor.mjs` |
 | `src/control.mjs`, `src/control-io.mjs`, `src/roster-edit.mjs` | `node test-control.mjs` |
+| `src/solana/pump.mjs`, `src/solana/wallets.mjs`, `src/solana/jito.mjs`, `src/solana/sniper.mjs` | `node test-sniper.mjs` |
 
 `npm test` runs a syntax check across every file first — two syntax errors have
 already shipped in test files that nothing was executing.
