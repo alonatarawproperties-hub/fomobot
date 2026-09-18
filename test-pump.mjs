@@ -20,14 +20,14 @@ import {
   tokensForSolIn, solIntoCurveForBudget, planLadder, applyBuy,
   GLOBAL_OFFSET, BUY_DISCRIMINATOR, PUMP_PROGRAM, TOKEN_PROGRAM,
   ASSOCIATED_TOKEN_PROGRAM, TOKEN_2022_PROGRAM, tokenProgramForMintAccount,
-} from './src/solana/pump.mjs';
+} from './src/pump/pump.mjs';
 import {
   loadSniperWallets, keypairFromBase58, solStringToLamports, auditSplit,
   MAX_BUNDLE_TRANSACTIONS,
-} from './src/solana/wallets.mjs';
-import { JitoClient, normaliseStatus, MAX_BUNDLE_SIZE } from './src/solana/jito.mjs';
-import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS } from './src/solana/sniper.mjs';
-import { decideSnipeCommand, resolveTelegram } from './src/solana/snipe-control.mjs';
+} from './src/pump/wallets.mjs';
+import { JitoClient, normaliseStatus, MAX_BUNDLE_SIZE } from './src/pump/jito.mjs';
+import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS } from './src/pump/sniper.mjs';
+import { decideSnipeCommand, resolveTelegram } from './src/pump/snipe-control.mjs';
 
 let pass = 0;
 const ok = (n) => { console.log(`  ok  ${n}`); pass++; };

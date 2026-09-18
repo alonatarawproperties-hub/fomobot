@@ -729,7 +729,7 @@ Each has a dedicated offline regression suite. Run it before and after.
 | `src/aggregator.mjs` | `node test-aggregator.mjs` |
 | `src/executor.mjs`, `src/executor-io.mjs`, the wiring in `index.mjs` | `node test-executor.mjs` |
 | `src/control.mjs`, `src/control-io.mjs`, `src/roster-edit.mjs` | `node test-control.mjs` |
-| `src/solana/pump.mjs`, `src/solana/wallets.mjs`, `src/solana/jito.mjs`, `src/solana/sniper.mjs`, `src/solana/snipe-control.mjs` | `node test-sniper.mjs` |
+| `src/pump/pump.mjs`, `src/pump/wallets.mjs`, `src/pump/jito.mjs`, `src/pump/sniper.mjs`, `src/pump/snipe-control.mjs` | `node test-pump.mjs` |
 
 `npm test` runs a syntax check across every file first — two syntax errors have
 already shipped in test files that nothing was executing.

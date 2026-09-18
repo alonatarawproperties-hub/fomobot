@@ -14,10 +14,10 @@
 
 import fs from 'node:fs';
 import { Connection, PublicKey } from '@solana/web3.js';
-import { loadSniperWallets, auditSplit, solStringToLamports } from './src/solana/wallets.mjs';
-import { JitoClient } from './src/solana/jito.mjs';
-import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS } from './src/solana/sniper.mjs';
-import { decideSnipeCommand, resolveTelegram } from './src/solana/snipe-control.mjs';
+import { loadSniperWallets, auditSplit, solStringToLamports } from './src/pump/wallets.mjs';
+import { JitoClient } from './src/pump/jito.mjs';
+import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS } from './src/pump/sniper.mjs';
+import { decideSnipeCommand, resolveTelegram } from './src/pump/snipe-control.mjs';
 import { startControl } from './src/control-io.mjs';
 
 const args = new Set(process.argv.slice(2));

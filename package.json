@@ -10,14 +10,14 @@
   "scripts": {
     "start": "node index.mjs",
     "dry": "node index.mjs --dry",
-    "test": "npm run check && node test.mjs && node test-m02.mjs && node test-positions.mjs && node test-rh.mjs && node test-aggregator.mjs && node test-executor.mjs && node test-control.mjs && node test-sniper.mjs",
+    "test": "npm run check && node test.mjs && node test-m02.mjs && node test-positions.mjs && node test-rh.mjs && node test-aggregator.mjs && node test-executor.mjs && node test-control.mjs && node test-pump.mjs",
     "survey": "node survey.mjs 60",
-    "check": "node --check index.mjs && node --check scripts/new-wallet.mjs && node --check scripts/configure-executor.mjs && node --check survey.mjs && node --check test.mjs && node --check test-m02.mjs && node --check test-positions.mjs && node --check test-rh.mjs && node --check test-aggregator.mjs && node --check test-executor.mjs && node --check test-control.mjs && node --check src/feed.mjs && node --check src/decode.mjs && node --check src/matcher.mjs && node --check src/notify.mjs && node --check src/record.mjs && node --check src/solana.mjs && node --check src/policy.mjs && node --check src/sellability.mjs && node --check src/positions.mjs && node --check src/robinhood-trade.mjs && node --check src/chain/robinhood.mjs && node --check src/aggregator.mjs && node --check src/executor.mjs && node --check src/executor-io.mjs && node --check src/control.mjs && node --check src/roster-edit.mjs && node --check src/control-io.mjs && node --check src/solana/pump.mjs && node --check src/solana/wallets.mjs && node --check src/solana/jito.mjs && node --check src/solana/sniper.mjs && node --check test-sniper.mjs && node --check snipe.mjs && node --check src/solana/snipe-control.mjs && node --check scripts/telegram-chat-id.mjs",
+    "check": "node --check index.mjs && node --check scripts/new-wallet.mjs && node --check scripts/configure-executor.mjs && node --check survey.mjs && node --check test.mjs && node --check test-m02.mjs && node --check test-positions.mjs && node --check test-rh.mjs && node --check test-aggregator.mjs && node --check test-executor.mjs && node --check test-control.mjs && node --check src/feed.mjs && node --check src/decode.mjs && node --check src/matcher.mjs && node --check src/notify.mjs && node --check src/record.mjs && node --check src/solana.mjs && node --check src/policy.mjs && node --check src/sellability.mjs && node --check src/positions.mjs && node --check src/robinhood-trade.mjs && node --check src/chain/robinhood.mjs && node --check src/aggregator.mjs && node --check src/executor.mjs && node --check src/executor-io.mjs && node --check src/control.mjs && node --check src/roster-edit.mjs && node --check src/control-io.mjs && node --check src/pump/pump.mjs && node --check src/pump/wallets.mjs && node --check src/pump/jito.mjs && node --check src/pump/sniper.mjs && node --check test-pump.mjs && node --check snipe-pump.mjs && node --check src/pump/snipe-control.mjs && node --check scripts/telegram-chat-id.mjs",
     "paper": "node index.mjs --paper",
     "new-wallet": "node scripts/new-wallet.mjs",
     "configure": "node scripts/configure-executor.mjs",
-    "snipe": "node snipe.mjs",
-    "snipe:live": "node snipe.mjs --live",
+    "snipe": "node snipe-pump.mjs",
+    "snipe:live": "node snipe-pump.mjs --live",
     "chat-id": "node scripts/telegram-chat-id.mjs"
   },
   "dependencies": {
