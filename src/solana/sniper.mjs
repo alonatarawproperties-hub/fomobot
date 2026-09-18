@@ -57,8 +57,8 @@ export class PumpSniper extends EventEmitter {
   constructor(opts) {
     super();
     const {
-      connection, jito, wallets, mints,
-      slippageBps, tipLamports, tipWalletIndex = wallets.length - 1,
+      connection, jito, wallets,
+      slippageBps, tipLamports, mints = [], tipWalletIndex = wallets.length - 1,
       computeUnitLimit = 250_000, computeUnitPriceMicroLamports = 500_000,
       maxPreBuyLamports = 0n, paper = true,
     } = opts;
@@ -69,7 +69,11 @@ export class PumpSniper extends EventEmitter {
     if (wallets.length > MAX_BUNDLE_SIZE) {
       throw new Error(`sniper: ${wallets.length} wallets exceeds the ${MAX_BUNDLE_SIZE}-transaction bundle limit`);
     }
-    if (!Array.isArray(mints) || mints.length === 0) throw new Error('sniper: no target mints');
+    // Deliberately allowed to be empty. The contract address is usually not
+    // known when the process starts — that is the entire reason the Telegram
+    // control plane exists — so "no target yet" is a normal state to boot into,
+    // not an error. watch() is where a missing target becomes a refusal.
+    if (mints !== undefined && !Array.isArray(mints)) throw new Error('sniper: mints must be an array');
     if (tipWalletIndex < 0 || tipWalletIndex >= wallets.length) {
       throw new Error(`sniper: tipWalletIndex ${tipWalletIndex} is outside the wallet list`);
     }
@@ -331,6 +335,7 @@ export class PumpSniper extends EventEmitter {
    */
   async watch() {
     if (!this.global) throw new Error('sniper: prime() has not run');
+    if (this.mints.length === 0) throw new Error('sniper: no target set — nothing to watch');
     // Armed BEFORE the first subscription, not after the last. Subscribing is
     // not instant, and a launch landing on the first mint while the second is
     // still being set up would otherwise be dropped by the guard in the handler
@@ -425,5 +430,62 @@ export class PumpSniper extends EventEmitter {
       elapsedMs: Date.now() - seenAt,
     });
     return result;
+  }
+
+  /**
+   * Point the sniper at a contract address, replacing whatever it was watching.
+   *
+   * Unsubscribes first: leaving the old subscription up would keep a stale
+   * launch armed against the same five budgets, and whichever fired first would
+   * spend money the other one was still counting on.
+   *
+   * A Solana address carries NO CHECKSUM — any 32 bytes is syntactically valid —
+   * so a typo that still decodes is indistinguishable from the real thing. This
+   * cannot be validated away. What saves us is that a wrong address derives a
+   * bonding curve that no launch will ever write, so the bot simply waits
+   * forever instead of buying the wrong token. The failure mode of a typo here
+   * is a miss, not a loss.
+   */
+  async setTarget(mintString) {
+    let mint;
+    try {
+      mint = new PublicKey(mintString);
+    } catch {
+      throw new Error(`not a valid contract address: ${mintString}`);
+    }
+    // A mint must be a real 32-byte key, not something off the ed25519 curve
+    // check — PublicKey accepts any 32 bytes, so this only catches length.
+    const wasArmed = this.armed;
+    if (this.subscriptions.size > 0) await this.unwatch();
+    this.mints = [mint];
+    // A new target has not been bought yet, whatever the old one's state was.
+    this.fired.delete(mint.toBase58());
+    this.emit('target', { mint: mint.toBase58(), bondingCurve: deriveBondingCurve(mint).toBase58(), wasArmed });
+    return mint;
+  }
+
+  /**
+   * Switch between paper and live.
+   *
+   * Refused while armed. Flipping mode under a live subscription means the very
+   * next write to that curve is handled under rules the operator set for a
+   * different one — and in the paper->live direction that is a real bundle sent
+   * by someone who was still rehearsing. Disarm, switch, re-arm.
+   */
+  setMode(mode) {
+    if (mode !== 'paper' && mode !== 'live') throw new Error(`unknown mode: ${mode}`);
+    if (this.armed) throw new Error('disarm before changing mode — switching while armed would change the rules mid-launch');
+    this.paper = mode === 'paper';
+    this.emit('mode', { mode });
+    return this.paper;
+  }
+
+  get mode() {
+    return this.paper ? 'paper' : 'live';
+  }
+
+  /** The currently targeted mint, or null. */
+  get target() {
+    return this.mints.length ? this.mints[0].toBase58() : null;
   }
 }

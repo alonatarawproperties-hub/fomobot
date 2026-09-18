@@ -2,81 +2,79 @@
 // pump.fun launch sniper — entrypoint.
 //
 // Separate from index.mjs on purpose. The copy-trader is a long-lived watcher
-// that reacts to whatever a roster wallet happens to do; this is armed at a
-// named set of contract addresses for one launch and then it is done. Folding
-// the two together would mean the copy-trader's config could arm a sniper by
-// accident, and there is no version of that which is worth the shared file.
+// that reacts to whatever a roster wallet happens to do; this is pointed at one
+// launch and then it is done. Folding them together would mean the copy-trader's
+// config could arm a sniper by accident.
 //
-// Refuses to sign unless --live is passed. There is deliberately no way to set
-// live mode from the config file: arming five funded wallets should require a
-// deliberate act at the command line, every single time.
+// Boots with no contract address. That is the normal case: the CA usually
+// arrives shortly before the launch, and it is set over Telegram with /target.
+// Until then the process sits primed — fee read, wallets loaded, balances
+// checked, blockhash warm — so arming is a single message and no setup happens
+// in the hot path.
 
 import fs from 'node:fs';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { loadSniperWallets, auditSplit, solStringToLamports } from './src/solana/wallets.mjs';
 import { JitoClient } from './src/solana/jito.mjs';
 import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS } from './src/solana/sniper.mjs';
+import { decideSnipeCommand } from './src/solana/snipe-control.mjs';
+import { startControl } from './src/control-io.mjs';
 
 const args = new Set(process.argv.slice(2));
-const LIVE = args.has('--live');
-const PAPER = !LIVE;
+const START_LIVE = args.has('--live');
 
-const SOL = (lamports) => `${(Number(lamports) / 1e9).toFixed(9).replace(/0+$/, '').replace(/\.$/, '')} SOL`;
+const SOL = (l) => `${(Number(l) / 1e9).toFixed(9).replace(/0+$/, '').replace(/\.$/, '') || '0'} SOL`;
 const log = (level, msg, extra) =>
-  console.log(`${new Date().toISOString()} ${level.padEnd(5)} ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`);
+  console.log(`${new Date().toISOString()} ${level.padEnd(6)} ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`);
 
 function loadConfig() {
   const raw = JSON.parse(fs.readFileSync('./config.json', 'utf8'));
   const s = raw.sniper;
   if (!s) throw new Error('config: no "sniper" block. Copy the one in config.example.json.');
   if (!s.rpcUrl || !s.wsUrl) throw new Error('config: sniper.rpcUrl and sniper.wsUrl are both required');
-  if (!Array.isArray(s.mints) || s.mints.length === 0) {
-    throw new Error('config: sniper.mints is empty — there is nothing to snipe');
-  }
-  for (const m of s.mints) {
-    try { new PublicKey(m); } catch { throw new Error(`config: "${m}" is not a valid mint address`); }
-  }
   if (!Array.isArray(s.wallets) || s.wallets.length === 0) throw new Error('config: sniper.wallets is empty');
-  return s;
+  // mints is OPTIONAL — the target normally arrives over Telegram.
+  for (const m of s.mints ?? []) {
+    try { new PublicKey(m); } catch { throw new Error(`config: "${m}" is not a valid contract address`); }
+  }
+  if ((s.mints ?? []).length > 1) {
+    throw new Error(
+      'config: sniper.mints holds more than one address. All five wallet budgets are spent on whichever ' +
+      'launches first, so a second target would be armed against money already gone. Snipe one at a time.',
+    );
+  }
+  return { sniper: s, telegram: raw.telegram };
 }
 
 async function main() {
-  const cfg = loadConfig();
+  const { sniper: cfg, telegram } = loadConfig();
 
   const totalLamports = solStringToLamports(cfg.totalSol, 'config: sniper.totalSol');
   const tipLamports = solStringToLamports(cfg.jitoTipSol, 'config: sniper.jitoTipSol');
   const slippageBps = BigInt(cfg.slippageBps ?? 500);
   const maxPreBuyLamports = solStringToLamports(cfg.maxPreBuySol ?? '0.000000001', 'config: sniper.maxPreBuySol');
 
-  // Keys come from the environment only. This throws if any is missing, does
-  // not match its configured address, is duplicated, or was left in the config.
   const wallets = loadSniperWallets(cfg.wallets, process.env);
-
   const split = auditSplit({
     wallets, totalLamports, tipLamports,
     ataRentLamports: ATA_RENT_LAMPORTS, signatureFeeLamports: SIGNATURE_FEE_LAMPORTS,
   });
 
-  console.log(`\n  mode          ${PAPER ? 'PAPER — nothing will be signed or sent' : 'LIVE — this will spend real SOL'}`);
+  console.log(`\n  mode          ${START_LIVE ? 'LIVE — this will spend real SOL' : 'PAPER — nothing signed or sent'}`);
   console.log(`  wallets       ${wallets.length}`);
-  console.log(`  targets       ${cfg.mints.length}`);
-  console.log(`  budget        ${SOL(split.buyTotal)} across buys, ${SOL(split.overhead)} overhead, ${SOL(split.required)} required`);
+  console.log(`  target        ${(cfg.mints ?? [])[0] ?? '(none — set it with /target over Telegram)'}`);
+  console.log(`  budget        ${SOL(split.buyTotal)} across buys, ${SOL(split.overhead)} overhead`);
   console.log(`  declared      ${SOL(totalLamports)}${split.withinBudget ? `  (${SOL(split.headroom)} spare)` : ''}`);
   console.log(`  slippage      ${slippageBps} bps\n`);
 
   if (!split.withinBudget) {
     throw new Error(
       `config: the split needs ${SOL(split.required)} but sniper.totalSol declares ${SOL(totalLamports)} ` +
-      `— ${SOL(split.excess)} short. Buys are not the whole cost: each wallet also pays token-account rent ` +
-      `and a signature fee, and one pays the Jito tip.`,
+      `— ${SOL(split.excess)} short. Each wallet also pays token-account rent and a signature fee, and one pays the tip.`,
     );
   }
   if (split.allAmountsIdentical && wallets.length > 1) {
-    log('warn', 'every wallet is buying the same amount — five identical buys in one bundle is a signature, not a split');
-  }
-
-  for (const w of wallets) {
-    log('info', `wallet ${w.index + 1}`, { address: w.address, budget: SOL(w.budgetLamports) });
+    log('warn', 'every wallet is buying the same amount — five identical buys is a signature, not a split');
   }
 
   const connection = new Connection(cfg.rpcUrl, { commitment: 'processed', wsEndpoint: cfg.wsUrl });
@@ -84,70 +82,161 @@ async function main() {
 
   const sniper = new PumpSniper({
     connection, jito, wallets,
-    mints: cfg.mints,
+    mints: cfg.mints ?? [],
     slippageBps, tipLamports,
     tipWalletIndex: cfg.tipWalletIndex ?? wallets.length - 1,
     computeUnitLimit: cfg.computeUnitLimit ?? 250_000,
     computeUnitPriceMicroLamports: cfg.computeUnitPriceMicroLamports ?? 500_000,
     maxPreBuyLamports,
-    paper: PAPER,
+    paper: !START_LIVE,
   });
+
+  const startedAt = Date.now();
+  let lastResult = null;
+  let balances = [];
+  let notify = async () => {};
 
   sniper.on('primed', (d) => log('info', 'primed from chain', d));
   sniper.on('watching', (d) => log('info', 'watching', d));
-  sniper.on('skipped', (d) => log('warn', 'skipped', d));
-  sniper.on('firing', (d) => log('signal', `LAUNCH ${d.mint}`, { slot: d.slot, creator: d.creator }));
-  sniper.on('paper', (d) => log('info', 'paper bundle built, not sent', d));
-  sniper.on('sent', (d) => log('signal', 'BUNDLE SENT', d));
+  sniper.on('target', (d) => log('info', 'target set', d));
+  sniper.on('mode', (d) => log('info', 'mode', d));
+  sniper.on('skipped', (d) => { log('warn', 'skipped', d); notify(`⚠️ Skipped <code>${d.mint}</code> — ${d.reason}`); });
+  sniper.on('firing', (d) => { log('signal', `LAUNCH ${d.mint}`, { slot: d.slot }); notify(`\u{1F680} <b>LAUNCH DETECTED</b>\n<code>${d.mint}</code>\nslot ${d.slot}`); });
+  sniper.on('paper', (d) => {
+    lastResult = `paper bundle built in ${d.elapsedMs}ms`;
+    log('info', 'paper bundle built, not sent', d);
+    notify(`\u{1F4C4} <b>Paper</b> — built ${d.transactions} transactions in ${d.elapsedMs}ms. Nothing sent.`);
+  });
+  sniper.on('sent', (d) => {
+    lastResult = `bundle ${d.bundleId?.slice(0, 12)} sent in ${d.elapsedMs}ms`;
+    log('signal', 'BUNDLE SENT', d);
+    notify(`\u{1F4B8} <b>BUNDLE SENT</b>\n<code>${d.bundleId}</code>\n${d.acceptedBy?.length ?? 0} relay(s), ${d.elapsedMs}ms`);
+  });
   sniper.on('warn', (d) => log('warn', 'warning', d));
-  sniper.on('error', (d) => log('error', 'error', d));
+  sniper.on('error', (d) => { log('error', 'error', d); notify(`\u{1F534} Error: ${d.error}`); });
 
   await sniper.prime();
+  sniper.startBlockhashRefresh(cfg.blockhashRefreshMs ?? 2000);
 
-  // Every number in the plan comes off the chain we just read, so print it
-  // before arming. An operator should be able to see what five buys will do to
-  // the curve without having to trust that it worked.
-  const preview = sniper.plan(sniper.initialReserves());
-  console.log('\n  plan against a fresh curve:');
-  for (const leg of preview.legs) {
-    const px = Number(leg.solIntoCurve) / Number(leg.expectedTokens);
-    console.log(
-      `    ${leg.label}  ${SOL(leg.budgetLamports).padStart(14)}  ` +
-      `-> ${leg.expectedTokens.toString().padStart(18)} tokens  ` +
-      `ask ${leg.requestTokens.toString().padStart(18)}  @ ${px.toExponential(4)}`,
-    );
-  }
-  const first = Number(preview.legs[0].solIntoCurve) / Number(preview.legs[0].expectedTokens);
-  const last = Number(preview.legs.at(-1).solIntoCurve) / Number(preview.legs.at(-1).expectedTokens);
-  console.log(`\n  the last wallet pays ${((last / first - 1) * 100).toFixed(2)}% more per token than the first.`);
-  console.log('  That is this bundle moving the curve against itself, and it is unavoidable');
-  console.log('  when five buys land back to back. It is the price of the split.\n');
-
-  const balances = await sniper.checkBalances();
-  let short = false;
+  const refreshBalances = async () => {
+    balances = await sniper.checkBalances();
+    return balances;
+  };
+  await refreshBalances();
   for (const b of balances) {
     log(b.sufficient ? 'info' : 'error', `balance ${b.address}`, {
       have: SOL(b.balance), need: SOL(b.required), ...(b.sufficient ? {} : { short: SOL(b.shortfall) }),
     });
-    if (!b.sufficient) short = true;
   }
-  if (short && LIVE) {
-    throw new Error('refusing to arm: at least one wallet cannot cover its leg, and one failed leg voids the bundle');
-  }
-  if (short) log('warn', 'wallets underfunded — paper mode continues, but --live would refuse here');
 
-  // Start the refresh BEFORE arming. prime() put one blockhash in hand, but a
-  // launch that fires minutes later would be signing against a stale one, and a
-  // blockhash that has aged out is rejected by the cluster rather than landing
-  // late — the bundle would simply never appear.
-  sniper.startBlockhashRefresh(cfg.blockhashRefreshMs ?? 2000);
+  const previewPlan = () => {
+    const p = sniper.plan(sniper.initialReserves());
+    const px = (l) => Number(l.solIntoCurve) / Number(l.expectedTokens);
+    return {
+      legs: p.legs,
+      selfImpactPct: ((px(p.legs.at(-1)) / px(p.legs[0]) - 1) * 100).toFixed(2),
+    };
+  };
+  const preview = previewPlan();
+  console.log('\n  plan against a fresh curve:');
+  for (const leg of preview.legs) {
+    console.log(`    ${leg.label}  ${SOL(leg.budgetLamports).padStart(14)}  -> ${leg.expectedTokens.toString().padStart(18)} tokens`);
+  }
+  console.log(`\n  the last wallet pays ${preview.selfImpactPct}% more per token than the first.\n`);
+
+  const snapshot = () => ({
+    mode: sniper.mode,
+    armed: sniper.armed,
+    target: sniper.target,
+    wallets: wallets.map((w, i) => ({
+      address: w.address, budgetLamports: w.budgetLamports,
+      balance: balances[i]?.balance, sufficient: balances[i]?.sufficient,
+    })),
+    buyTotalLamports: split.buyTotal,
+    slippageBps,
+    feeBasisPoints: sniper.global?.feeBasisPoints?.toString(),
+    uptimeMs: Date.now() - startedAt,
+    funded: balances.every((b) => b.sufficient),
+    underfunded: balances.filter((b) => !b.sufficient).length,
+    plan: preview.legs,
+    selfImpactPct: preview.selfImpactPct,
+    lastResult,
+  });
+
+  if (telegram?.enabled && telegram.botToken && telegram.chatId) {
+    const control = startControl({
+      botToken: telegram.botToken,
+      chatId: telegram.chatId,
+      snapshot,
+      decide: decideSnipeCommand,
+      log: (m, e) => log('info', `telegram: ${m}`, e),
+      startedAt,
+      onAction: async (action, payload) => {
+        switch (action) {
+          case 'set-target':
+            await sniper.setTarget(payload);
+            break;
+          case 'arm': {
+            // Re-read balances at arm time, not just at boot: a wallet drained
+            // since startup would fail its leg, and one failed leg voids the
+            // bundle for all five.
+            await refreshBalances();
+            const short = balances.filter((b) => !b.sufficient);
+            if (short.length && sniper.mode === 'live') {
+              await control.send(
+                `⚠️ <b>Refusing to arm.</b> ${short.length} wallet(s) cannot cover their leg:\n\n`
+                + short.map((b) => `<code>${b.address}</code>\n  short ${SOL(b.shortfall)}`).join('\n')
+                + '\n\nOne short leg voids the whole bundle.',
+              );
+              return;
+            }
+            await sniper.watch();
+            await control.send(
+              `\u{1F3AF} <b>ARMED</b> · ${sniper.mode === 'live' ? '\u{1F4B8} LIVE' : '\u{1F4C4} PAPER'}\n`
+              + `<code>${sniper.target}</code>\n\n`
+              + (short.length ? `⚠️ ${short.length} wallet(s) underfunded (paper, so allowed)\n\n` : '')
+              + `Watching the bonding curve. /disarm or /abort to stop.`,
+            );
+            break;
+          }
+          case 'disarm':
+            await sniper.unwatch();
+            break;
+          case 'live':
+            sniper.setMode('live');
+            break;
+          case 'paper':
+            sniper.setMode('paper');
+            break;
+          case 'abort':
+            await sniper.unwatch();
+            sniper.setMode('paper');
+            break;
+        }
+      },
+    });
+    notify = (text) => control.send(text).catch(() => {});
+    log('info', 'telegram control plane up', { chatId: String(telegram.chatId) });
+    await control.send(
+      `\u{1F916} <b>Sniper up</b> · ${sniper.mode === 'live' ? '\u{1F4B8} LIVE' : '\u{1F4C4} PAPER'}\n\n`
+      + `${wallets.length} wallets · ${SOL(split.buyTotal)} budget\n`
+      + `${sniper.target ? `target <code>${sniper.target}</code>` : 'no target yet'}\n\n`
+      + 'Send /target when you have the contract address, then /arm. /help for everything.',
+    );
+  } else {
+    log('warn', 'telegram is not configured — this bot can only be controlled from the shell');
+  }
 
   const shutdown = async () => { await sniper.unwatch(); sniper.stopBlockhashRefresh(); process.exit(0); };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  await sniper.watch();
-  log('info', PAPER ? 'armed (paper)' : 'ARMED LIVE', { mints: cfg.mints.length });
+  if (sniper.target) {
+    await sniper.watch();
+    log('info', sniper.mode === 'paper' ? 'armed (paper)' : 'ARMED LIVE', { target: sniper.target });
+  } else {
+    log('info', 'idle — waiting for /target over Telegram');
+  }
 }
 
 main().catch((err) => {

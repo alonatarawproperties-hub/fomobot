@@ -422,7 +422,7 @@ Needs Node 22+ (for the built-in WebSocket).
 ```sh
 npm install
 cp config.example.json config.json   # fill in Helius, Telegram, and the executor block
-npm test                             # 227 offline assertions, no network
+npm test                             # 242 offline assertions, no network
 npm run paper                        # detect + decide + simulate, sign nothing
 npm start
 ```
@@ -603,6 +603,59 @@ the Jito tip. A split summing to exactly 10 SOL leaves nothing for any of it, an
 the shortfall would not surface as a warning — the underfunded leg fails and the
 bundle is atomic, so it takes the other four fills with it.
 
+### Driving it from Telegram
+
+The contract address is rarely known when the process starts, so the sniper
+boots without one. It primes from the chain, loads the keys, checks the balances
+and warms a blockhash, then sits idle — so arming later is a single message and
+nothing is set up in the hot path.
+
+```
+/status   is it armed, on what, in which mode, is it funded
+/target   /target <contract address>
+/arm      re-check balances, subscribe, start watching
+/disarm   stop watching
+
+/plan     what the five buys will do to the curve
+/wallets  addresses, budgets and live balances
+
+/live     spend real SOL
+/paper    rehearse, sign nothing
+/abort    disarm AND switch to paper, from any state
+```
+
+It shares the copy-trader's poll loop rather than running a second one, so it
+inherits every fix that loop already carries: the stale-message rule that stops a
+`/resume` sent yesterday acting today, the update-offset ordering that used to
+eat the first command ever sent, the 409 detection that catches a second copy
+running on the same token, and the backoff that stops a bad token hammering
+Telegram. Only the command vocabulary differs, injected as `decide`.
+
+**`/arm` re-reads every balance** rather than trusting the check from startup. A
+wallet drained since boot would fail its leg, and one failed leg voids the bundle
+for all five — so in live mode a short wallet refuses to arm and names the
+shortfall.
+
+**Mode cannot change while armed.** Flipping paper→live under a live subscription
+means the next write to that curve is handled under rules set for a different
+one — which is a real bundle sent by someone who thought they were rehearsing.
+Disarm, switch, re-arm. `/abort` does both at once and always lands safe, because
+someone reaching for it is not in a position to work out which command they
+needed.
+
+**A typo in the address cannot be caught.** A Solana address carries no checksum,
+so any 32 bytes is valid and a mistyped CA is indistinguishable from a real one.
+What saves you is that a wrong address derives a bonding curve nothing will ever
+write, so the bot waits forever rather than buying the wrong token — a miss, not
+a loss. The bot says so every time you set a target.
+
+**The bot token is the key to the wallets.** `/live` and `/arm` are both
+reachable from the phone, by deliberate choice, which means anyone who obtains
+the bot token or access to that chat can spend the whole budget. `telegram.chatId`
+is the only thing in the way. Telegram tokens leak through screenshots, chat
+exports and phone backups; treat that token as being exactly as sensitive as the
+five private keys, and keep the budget to what you are willing to lose to it.
+
 ### Known limits — read these before arming it
 
 - **There is no exit.** Same as the copy-trader: it buys and holds. Selling is
@@ -618,6 +671,9 @@ bundle is atomic, so it takes the other four fills with it.
   against the current tip floor, so a contested launch can out-tip it.
 - **Only the bonding curve is handled.** A mint that has already graduated to
   PumpSwap is refused rather than routed.
+- **One target at a time.** All five budgets go to whichever launch fires first,
+  so a second target would be armed against money already spent. Startup refuses
+  a config with more than one, and `/target` replaces rather than adds.
 
 ## Files that need their test run before you change them
 
@@ -632,7 +688,7 @@ Each has a dedicated offline regression suite. Run it before and after.
 | `src/aggregator.mjs` | `node test-aggregator.mjs` |
 | `src/executor.mjs`, `src/executor-io.mjs`, the wiring in `index.mjs` | `node test-executor.mjs` |
 | `src/control.mjs`, `src/control-io.mjs`, `src/roster-edit.mjs` | `node test-control.mjs` |
-| `src/solana/pump.mjs`, `src/solana/wallets.mjs`, `src/solana/jito.mjs`, `src/solana/sniper.mjs` | `node test-sniper.mjs` |
+| `src/solana/pump.mjs`, `src/solana/wallets.mjs`, `src/solana/jito.mjs`, `src/solana/sniper.mjs`, `src/solana/snipe-control.mjs` | `node test-sniper.mjs` |
 
 `npm test` runs a syntax check across every file first — two syntax errors have
 already shipped in test files that nothing was executing.

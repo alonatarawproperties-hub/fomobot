@@ -27,6 +27,7 @@ import {
 } from './src/solana/wallets.mjs';
 import { JitoClient, normaliseStatus, MAX_BUNDLE_SIZE } from './src/solana/jito.mjs';
 import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS } from './src/solana/sniper.mjs';
+import { decideSnipeCommand } from './src/solana/snipe-control.mjs';
 
 let pass = 0;
 const ok = (n) => { console.log(`  ok  ${n}`); pass++; };
@@ -474,11 +475,49 @@ console.log('\nthe fire gate');
     mints: [Keypair.generate().publicKey.toBase58()],
     slippageBps: 500n, tipLamports: 1n,
   };
-  assert.throws(() => new PumpSniper({ ...base, mints: [] }), /no target mints/);
   assert.throws(() => new PumpSniper({ ...base, wallets: [] }), /no wallets/);
   assert.throws(() => new PumpSniper({ ...base, tipWalletIndex: 3 }), /outside the wallet list/);
   assert.throws(() => new PumpSniper({ ...base, connection: null }), /connection is required/);
-  ok('a sniper with no mints, no wallets or a tip from a wallet it does not have will not construct');
+  assert.throws(() => new PumpSniper({ ...base, mints: 'not-an-array' }), /must be an array/);
+  ok('a sniper with no wallets, a tip from a wallet it lacks, or a non-array target will not construct');
+}
+{
+  const w = mkWallet();
+  const base = {
+    connection: {}, jito: {},
+    wallets: [{ index: 0, address: w.address, keypair: w.kp, budgetLamports: 1n }],
+    slippageBps: 500n, tipLamports: 1n,
+  };
+  // Booting with no contract address is the NORMAL case: it usually arrives
+  // later, over Telegram. It must not be an error until something tries to watch.
+  const s = new PumpSniper(base);
+  assert.equal(s.target, null);
+  assert.equal(s.mode, 'paper');
+  await assert.rejects(s.watch(), /prime\(\) has not run/);
+  s.global = { feeBasisPoints: FEE_BPS };
+  await assert.rejects(s.watch(), /no target set/);
+  ok('booting with no contract address is legal, and only watching without one is refused');
+}
+{
+  const w = mkWallet();
+  const s = new PumpSniper({
+    connection: {}, jito: {},
+    wallets: [{ index: 0, address: w.address, keypair: w.kp, budgetLamports: 1n }],
+    slippageBps: 500n, tipLamports: 1n, paper: true,
+  });
+  const mint = Keypair.generate().publicKey.toBase58();
+  await s.setTarget(mint);
+  assert.equal(s.target, mint);
+
+  // Re-targeting must clear the fired flag, or a mint bought in an earlier run
+  // would be silently skipped when aimed at again.
+  s.fired.add(mint);
+  await s.setTarget(mint);
+  assert.equal(s.fired.has(mint), false);
+
+  await assert.rejects(s.setTarget('obviously-not-an-address'), /not a valid contract address/);
+  assert.equal(s.target, mint); // a rejected target must not clear the good one
+  ok('a target can be set, re-set and cleared of its fired flag, and a bad one changes nothing');
 }
 {
   // A curve account is written on EVERY trade, not just at creation. Without
@@ -495,6 +534,26 @@ console.log('\nthe fire gate');
   sniper.fired.add(mint.toBase58());
   assert.equal(sniper.assess(mint, { complete: false, realSolReserves: 6n }).act, false);
   ok('a second write to a curve we already bought does not fire a second bundle');
+}
+
+{
+  const w = mkWallet();
+  const s = new PumpSniper({
+    connection: {}, jito: {},
+    wallets: [{ index: 0, address: w.address, keypair: w.kp, budgetLamports: 1n }],
+    slippageBps: 500n, tipLamports: 1n, paper: true,
+  });
+  assert.equal(s.setMode('live'), false);
+  assert.equal(s.mode, 'live');
+  assert.equal(s.setMode('paper'), true);
+  assert.throws(() => s.setMode('sideways'), /unknown mode/);
+
+  // The dangerous one: flipping paper->live while armed would mean the next
+  // write to that curve is handled under rules set for a different mode.
+  s.armed = true;
+  assert.throws(() => s.setMode('live'), /disarm before changing mode/);
+  assert.equal(s.mode, 'paper');
+  ok('mode switches both ways but is refused while armed, so rules cannot change mid-launch');
 }
 
 console.log('\nbundle assembly');
@@ -576,6 +635,131 @@ const CURVE = {
   s.blockhash = null;
   assert.throws(() => s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE) }), /no blockhash/);
   ok('building without a blockhash in hand throws instead of signing something unlandable');
+}
+
+console.log('\ntelegram control');
+
+const VALID_CA = 'Hn6C4FTuyK9Z5jZeDsiCe5i6YG56a3LYyPKWoV6Dpump';
+const snap = (over = {}) => ({
+  mode: 'paper', armed: false, target: null,
+  wallets: [{ address: 'W1', budgetLamports: 2_600_000_000n, balance: 3_000_000_000n, sufficient: true }],
+  buyTotalLamports: 9_550_000_000n, slippageBps: 500n, feeBasisPoints: '95',
+  uptimeMs: 3_600_000, funded: true, underfunded: 0, plan: [], ...over,
+});
+const cmd = (line) => {
+  const [head, ...args] = line.slice(1).split(/\s+/);
+  return { cmd: head.toLowerCase(), args };
+};
+
+{
+  const r = decideSnipeCommand(cmd(`/target ${VALID_CA}`), snap());
+  assert.equal(r.action, 'set-target');
+  assert.equal(r.payload, VALID_CA);
+  // A Solana address has no checksum, so the warning is not optional decoration.
+  assert.match(r.reply, /no checksum/);
+  ok('a valid contract address sets the target and warns that a typo cannot be caught');
+}
+{
+  const r = decideSnipeCommand(cmd('/target not-an-address'), snap());
+  assert.equal(r.action, 'none');
+  assert.match(r.reply, /not a valid contract address/);
+  const bare = decideSnipeCommand(cmd('/target'), snap());
+  assert.equal(bare.action, 'none');
+  assert.match(bare.reply, /Usage/);
+  ok('a malformed or missing address changes nothing and says how to use the command');
+}
+{
+  // The CA arrives as untrusted text and the reply is sent with parse_mode HTML.
+  // Unescaped, this would break the message or inject markup.
+  const r = decideSnipeCommand(cmd('/target <b>x</b>&y'), snap());
+  assert.equal(r.action, 'none');
+  assert.ok(!r.reply.includes('<b>x</b>'), 'raw HTML from user input must not reach the reply');
+  assert.match(r.reply, /&lt;b&gt;/);
+  assert.match(r.reply, /&amp;y/);
+  ok('user text is HTML-escaped, so a crafted address cannot inject markup into the reply');
+}
+{
+  const r = decideSnipeCommand(cmd(`/target ${VALID_CA}`), snap({ armed: true, target: 'old' }));
+  assert.equal(r.action, 'set-target');
+  // Re-targeting drops the old subscription; saying so is the difference between
+  // a deliberate change and silently ceasing to watch a launch.
+  assert.match(r.reply, /disarmed/i);
+  ok('re-targeting while armed says plainly that it disarmed you');
+}
+{
+  assert.match(decideSnipeCommand(cmd('/arm'), snap()).reply, /No target/);
+  assert.equal(decideSnipeCommand(cmd('/arm'), snap()).action, 'none');
+  const armed = decideSnipeCommand(cmd('/arm'), snap({ target: VALID_CA, armed: true }));
+  assert.equal(armed.action, 'none');
+  assert.match(armed.reply, /Already armed/);
+  const ready = decideSnipeCommand(cmd('/arm'), snap({ target: VALID_CA }));
+  assert.equal(ready.action, 'arm');
+  // Deliberately empty: the caller replies once it has re-read balances, so the
+  // confirmation reflects the funding check rather than pre-empting it.
+  assert.equal(ready.reply, '');
+  ok('arming needs a target, is idempotent, and defers its reply until balances are re-read');
+}
+{
+  const r = decideSnipeCommand(cmd('/live'), snap());
+  assert.equal(r.action, 'live');
+  assert.match(r.reply, /real SOL/);
+  assert.equal(decideSnipeCommand(cmd('/live'), snap({ mode: 'live' })).action, 'none');
+  // The dangerous one: mode must not flip under a live subscription.
+  const whileArmed = decideSnipeCommand(cmd('/live'), snap({ armed: true }));
+  assert.equal(whileArmed.action, 'none');
+  assert.match(whileArmed.reply, /Disarm first/);
+  ok('going live is refused while armed, so the rules cannot change mid-launch');
+}
+{
+  const whileArmed = decideSnipeCommand(cmd('/paper'), snap({ mode: 'live', armed: true }));
+  assert.equal(whileArmed.action, 'none');
+  assert.equal(decideSnipeCommand(cmd('/paper'), snap({ mode: 'live' })).action, 'paper');
+  assert.equal(decideSnipeCommand(cmd('/paper'), snap()).action, 'none');
+  ok('paper is reachable from live, refused while armed, and a no-op when already there');
+}
+{
+  // /abort has to land somewhere safe from EVERY state — someone reaching for it
+  // is not in a position to work out whether they needed /disarm or /paper.
+  for (const st of [snap(), snap({ armed: true, mode: 'live', target: VALID_CA }), snap({ mode: 'live' })]) {
+    const r = decideSnipeCommand(cmd('/abort'), st);
+    assert.equal(r.action, 'abort');
+    assert.match(r.reply, /ABORTED/);
+  }
+  // And it must never imply it sold anything.
+  assert.match(decideSnipeCommand(cmd('/abort'), snap()).reply, /cannot sell/);
+  ok('abort works from every state and never implies it closed a position');
+}
+{
+  const r = decideSnipeCommand(cmd('/status'), snap({ target: VALID_CA, mode: 'live', armed: true }));
+  assert.match(r.reply, /ARMED/);
+  assert.match(r.reply, /LIVE/);
+  assert.match(r.reply, /95 bps/);
+  const idle = decideSnipeCommand(cmd('/status'), snap());
+  assert.match(idle.reply, /IDLE/);
+  assert.match(idle.reply, /PAPER/);
+  assert.match(idle.reply, /none yet/);
+  ok('status names the mode, the target and the on-chain fee it primed with');
+}
+{
+  const r = decideSnipeCommand(cmd('/status'), snap({ funded: false, underfunded: 2 }));
+  assert.match(r.reply, /2 wallet\(s\) underfunded/);
+  assert.match(r.reply, /voids the whole bundle/);
+  ok('status surfaces underfunded wallets and what that costs');
+}
+{
+  assert.equal(decideSnipeCommand(cmd('/disarm'), snap()).action, 'none');
+  const r = decideSnipeCommand(cmd('/disarm'), snap({ armed: true }));
+  assert.equal(r.action, 'disarm');
+  assert.match(r.reply, /Nothing was sold/);
+  ok('disarm is a no-op when idle and never implies it exited a position');
+}
+{
+  const r = decideSnipeCommand(cmd('/nonsense'), snap());
+  assert.equal(r.action, 'none');
+  assert.match(r.reply, /Unknown command/);
+  assert.match(r.reply, /\/target/); // the help comes with it
+  assert.match(decideSnipeCommand(cmd('/help'), snap()).reply, /\/abort/);
+  ok('an unknown command is refused with the full command list attached');
 }
 
 console.log(`\n${pass} passed\n`);

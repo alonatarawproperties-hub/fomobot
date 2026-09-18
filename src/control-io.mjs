@@ -52,7 +52,16 @@ export function saveControlState(path, state) {
  * @param {(action:string, payload?:any) => void} opts.onAction
  * @param {(msg:string, extra?:object) => void} opts.log
  */
-export function startControl({ botToken, chatId, snapshot, onAction, log = () => {}, startedAt = Date.now() }) {
+/**
+ * @param {object}   o
+ * @param {Function} [o.decide]  which command vocabulary this loop speaks.
+ *   Defaults to the copy-trader's. The sniper passes its own, because the two
+ *   bots answer to different commands but share every hard-won fix in the poll
+ *   loop below — the stale-message rule, the offset ordering, the 409 conflict
+ *   detection and the refusal backoff. A second copy of this loop would be a
+ *   second place for all four of those bugs to come back.
+ */
+export function startControl({ botToken, chatId, snapshot, onAction, log = () => {}, startedAt = Date.now(), decide = decideCommand }) {
   const stats = { polls: 0, commands: 0, rejected: 0, errors: 0, conflicts: 0, apiRefusals: 0, stale: 0 };
   let offset = null;
   let stopped = false;
@@ -133,8 +142,10 @@ export function startControl({ botToken, chatId, snapshot, onAction, log = () =>
           if (!parsed) continue;
 
           stats.commands += 1;
-          const { action, reply, payload } = decideCommand(parsed, snapshot());
-          if (action !== 'none') onAction(action, payload);
+          const { action, reply, payload } = decide(parsed, snapshot());
+          // The reply is sent AFTER the action is applied, so a status line in
+          // it reflects what just happened rather than the state before it.
+          if (action !== 'none') await onAction(action, payload);
           if (reply) await send(reply);
         }
       } catch (err) {
