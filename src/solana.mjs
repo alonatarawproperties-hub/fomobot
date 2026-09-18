@@ -308,6 +308,48 @@ const QUOTE_MINTS = new Set([
 ]);
 
 /**
+ * Programs that move tokens without trading them.
+ *
+ * THE SAME FALSE POSITIVE THE EVM SIDE HAD, observed there live on 2026-09-17:
+ * a plain transfer INTO the watched wallet read as a buy, because balance deltas
+ * cannot tell a purchase from a gift. Both show a token arriving.
+ *
+ * A swap always invokes a venue — an AMM, an aggregator, a bonding curve. A
+ * transfer, an airdrop and an account being funded invoke only these. So if NO
+ * top-level instruction reaches outside this set, nothing was traded, whatever
+ * the balances did.
+ *
+ * Judged on TOP-LEVEL instructions only. A swap's inner instructions are full of
+ * token transfers — that is what a swap is made of — so reading those would
+ * classify every real trade as a transfer.
+ */
+export const NON_SWAP_PROGRAMS = new Set([
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',  // SPL Token
+  'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',  // Token-2022
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', // Associated Token Account
+  '11111111111111111111111111111111',              // System
+  'ComputeBudget111111111111111111111111111111',   // Compute Budget
+  'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr',  // Memo v2
+  'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo',  // Memo v1
+]);
+
+/**
+ * True when a transaction only moved tokens around — no venue was involved.
+ *
+ * Returns false when the instruction list cannot be read, so an unreadable
+ * transaction is classified by its balances as before rather than silently
+ * dismissed as a transfer.
+ */
+export function isPlainTransfer(tx) {
+  const ix = tx?.transaction?.message?.instructions;
+  if (!Array.isArray(ix) || !ix.length) return false;
+  return ix.every((i) => {
+    const program = i?.programId ?? i?.program;
+    return typeof program === 'string' && NON_SWAP_PROGRAMS.has(program);
+  });
+}
+
+/**
  * Classify what a transaction did for one owner.
  *
  *   buy / sell  — a non-quote token's balance changed. A real position change.
@@ -331,6 +373,18 @@ export function classifyTrade(tx, owner) {
   // The traded asset is whatever moved that is not the currency it was paid in.
   const subject = deltas.find((d) => !QUOTE_MINTS.has(d.mint));
   if (subject) {
+    // A token arriving is not a purchase. If no venue was invoked, nothing was
+    // traded — reported as what it is so the movement is still visible, while
+    // isTrade stays false and the executor never acts on it.
+    if (isPlainTransfer(tx)) {
+      return {
+        side: 'transfer',
+        direction: subject.delta > 0n ? 'in' : 'out',
+        mint: subject.mint,
+        amount: subject.delta > 0n ? subject.delta : -subject.delta,
+        decimals: subject.decimals,
+      };
+    }
     return {
       side: subject.delta > 0n ? 'buy' : 'sell',
       mint: subject.mint,

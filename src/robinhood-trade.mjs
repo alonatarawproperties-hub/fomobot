@@ -29,6 +29,29 @@ export const QUOTE_TOKENS = new Set([
   '0x5fc5360d0400a0fd4f2af552add042d716f1d168',
 ]);
 
+/**
+ * Selectors that move a token WITHOUT buying it.
+ *
+ * THE FALSE POSITIVE THIS EXISTS FOR, observed live on 2026-09-17. Two alerts
+ * fired as "BUY on Robinhood Chain" for transactions whose selector was
+ * 0xa9059cbb — plain ERC-20 transfer() — sending a token INTO the watched
+ * wallet. Nothing was bought. They never appeared as trades on his profile
+ * because they are not trades.
+ *
+ * Deltas alone cannot tell the two apart, and that is not a fixable gap: fomo
+ * settles from a pooled account, so a REAL buy also shows the token arriving with
+ * no quote leg (see the README's account of tx 0x853010bc, +298,050.7 TWINE and
+ * no USDG out). Token in, nothing out, describes both.
+ *
+ * What separates them is the call. A swap goes through a router; nobody buys a
+ * token by calling transfer() on the token itself. So the top-level selector
+ * decides, and being wrong here costs a skipped signal rather than a wrong buy.
+ */
+export const TRANSFER_SELECTORS = new Set([
+  '0xa9059cbb', // transfer(address,uint256)
+  '0x23b872dd', // transferFrom(address,address,uint256)
+]);
+
 const lower = (s) => String(s ?? '').toLowerCase();
 /** A 32-byte topic word holds an address in its low 20 bytes. */
 const topicAddr = (t) => (typeof t === 'string' && t.length >= 42 ? '0x' + t.slice(-40).toLowerCase() : null);
@@ -81,7 +104,25 @@ export function erc20Deltas(receipt, owner) {
  *   funding     — only quote currency moved
  *   null        — nothing of ours moved, or the transaction failed
  */
-export function classifyRhTrade(receipt, owner, quoteTokens = QUOTE_TOKENS) {
+/**
+ * Did this transaction touch a contract we recognise as a trading venue?
+ *
+ * Checked against the transaction's target AND every log emitter, because a swap
+ * routed through a bundler has a target that is the entry point rather than the
+ * venue — but the venue still emits.
+ */
+export function venueTouched(receipt, call, venues) {
+  if (!venues?.size) return null;
+  const to = lower(call?.to);
+  if (to && venues.has(to)) return to;
+  for (const log of receipt?.logs ?? []) {
+    const addr = lower(log?.address);
+    if (addr && venues.has(addr)) return addr;
+  }
+  return null;
+}
+
+export function classifyRhTrade(receipt, owner, quoteTokens = QUOTE_TOKENS, call = null, venues = null) {
   // A reverted transaction moved nothing. `status` is '0x1' on success; treat
   // anything else, including a missing field, as not-a-trade rather than
   // assuming success on an incomplete receipt.
@@ -94,6 +135,64 @@ export function classifyRhTrade(receipt, owner, quoteTokens = QUOTE_TOKENS) {
 
   const subject = deltas.find((d) => !quoteTokens.has(d.token));
   if (subject) {
+    // NOT A PURCHASE, on either of two counts.
+    //
+    // A direct transfer() is a token moving rather than being bought — that is
+    // the case seen live on 2026-09-17.
+    //
+    // And a transaction whose TARGET is the token that arrived cannot be a
+    // purchase whatever method it called: you do not buy a token by calling the
+    // token. That catches a claim, a mint, a vesting release and anything else
+    // the token contract itself hands out, none of which the selector rule sees.
+    //
+    // Reported as what it is so the operator still sees the movement, and the
+    // recorder keeps the evidence — but isRhTrade is false, so nothing copies it.
+    const selector = lower(call?.selector);
+    const targetIsTheToken = call?.to && lower(call.to) === subject.token;
+    if (call && (TRANSFER_SELECTORS.has(selector) || targetIsTheToken)) {
+      return {
+        side: 'transfer',
+        direction: subject.delta > 0n ? 'in' : 'out',
+        token: subject.token,
+        amount: subject.delta > 0n ? subject.delta : -subject.delta,
+        selector: selector || null,
+        why: TRANSFER_SELECTORS.has(selector) ? 'transfer-selector' : 'target-is-the-token-itself',
+      };
+    }
+    // THE VENUE WHITELIST, when one is configured.
+    //
+    // Every rule above says what a purchase is NOT. This one says what it IS: a
+    // swap goes through a venue, and a token arriving without one was given, not
+    // bought — by an airdrop distributor, a vesting escrow, a rewards claim, a
+    // bridge. Those invoke a contract that is neither the token nor a venue, and
+    // nothing else catches them.
+    //
+    // THE COST IS REAL AND IS THE REASON THIS IS OPT-IN. fomo's router is
+    // proprietary and can be redeployed; the day it is, every real buy stops
+    // matching. So an unmatched arrival is NOT silently dropped — it returns
+    // `received`, which the caller alerts on loudly, because "the router moved"
+    // and "he was airdropped something" look identical here and only a human can
+    // tell them apart. Missing a buy while being told is survivable. Missing one
+    // in silence is not.
+    if (venues?.size) {
+      const venue = venueTouched(receipt, call, venues);
+      if (!venue) {
+        return {
+          side: 'received',
+          direction: subject.delta > 0n ? 'in' : 'out',
+          token: subject.token,
+          amount: subject.delta > 0n ? subject.delta : -subject.delta,
+          why: 'no-known-venue',
+        };
+      }
+      return {
+        side: subject.delta > 0n ? 'buy' : 'sell',
+        token: subject.token,
+        amount: subject.delta > 0n ? subject.delta : -subject.delta,
+        venue,
+      };
+    }
+
     return {
       side: subject.delta > 0n ? 'buy' : 'sell',
       token: subject.token,

@@ -35,6 +35,8 @@
     "rpcUrl": "https://rpc.mainnet.chain.robinhood.com",
     "wallet": "0xYOUR_WALLET_ADDRESS",
     "quoteToken": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+    "_venues_comment": "Contracts that count as a TRADING VENUE. Empty means off, and off is the old behaviour: a token arriving reads as a buy unless a transfer rule refuses it. With a list, a purchase must go THROUGH one of these -- anything else that puts a token in the wallet (an airdrop, a vesting release, a rewards claim, a bridge) is reported as 'received' and NEVER copied. THE ADDRESSES ARE NOT SHIPPED HERE ON PURPOSE: fomo's router is proprietary and redeployable, and a stale one would stop copying real buys. Read them off a known-good buy with `npm run find-venues -- <txHash>`. When a token arrives outside the list the bot alerts LOUDLY, because 'he was airdropped something' and 'the router moved' look identical from here and only you can tell them apart.",
+    "venues": [],
     "sizeUsd": 25,
     "slippageBps": 300,
     "maxOutputDriftBps": 300,
@@ -43,8 +45,51 @@
     "cooldownMs": 60000,
     "denylistTokens": []
   },
-  "sniper": {
-    "_comment": "pump.fun launch sniper, driven by `npm run snipe`. Five wallets buy ONE launch in a single Jito bundle. THE KEYS ARE NEVER IN THIS FILE - wallet N reads FIRSTFILL_SNIPER_KEY_N from the environment, and a key found here is a startup failure. `mints` is OPTIONAL and normally left empty: the contract address arrives over Telegram with /target shortly before the launch. Only one target at a time - all five budgets go to whichever launches first. totalSol is what you are declaring you will risk, and startup refuses if the per-wallet amounts plus tip, rent and fees exceed it.",
+  "snipe": {
+    "_comment": "Meteora Dynamic Bonding Curve launch sniper, driven by `npm run snipe`. It is SEPARATE from the copy-trading bot above and does not run with it. The Solana signing key is read from FIRSTFILL_SOLANA_KEY (base58, or a solana-keygen JSON array) and a key placed in this file is a startup failure. Run `npm run snipe -- plan` first and READ THE DERIVED ADDRESSES: they are all PDAs, so a wrong config produces a real-looking pool address that has nothing to do with your token.",
+    "mint": "PUT_THE_TOKEN_MINT_HERE",
+    "_config_comment": "The DBC config this launch uses. IF you can know it in advance, the pool address is derived ahead of time and the whole transaction is pre-signed, so firing is a socket write. BUT MANY LAUNCHPADS GENERATE A FRESH CONFIG PER LAUNCH, in the same bundle that creates the pool - in that case it cannot be known, and this MUST be left null. Do not paste a config read off some earlier token: the pool derived from it will be the wrong address. The bot now detects that and rebuilds from the live pool rather than refusing, but it is still wasted work in the middle of the race.",
+    "config": null,
+    "_basetokenprogram_comment": "The token program that will own the base mint. It cannot be read before the launch (the mint does not exist yet) but it CAN be known, from any earlier launch by the same launchpad - find-config prints it. Setting it removes the last RPC round trip from the hot path. Leave null and the bot fetches it mid-race, which works but costs time you are trying to save.",
+    "baseTokenProgram": null,
+    "_quote_comment": "What you pay in. Defaults to wrapped SOL. This MUST match the config's quote mint; arming refuses if it does not.",
+    "quoteMint": "So11111111111111111111111111111111111111112",
+    "_wallets_comment": "SEVERAL WALLETS, ONE LAUNCH. Each entry names the ENVIRONMENT VARIABLE holding that wallet's key -- never the key itself -- and what that wallet spends. Every wallet needs its own wrapped quote balance AND its own native SOL (token-account rent plus fees). `prepare` funds them all; `plan` reports which are short. A wallet that is short at arm time is DROPPED with a warning, not fatal: four of five is still a snipe. computeUnitPriceMicroLamports is OPTIONAL per wallet and overrides the global one: wallets racing a single launch all write the same pool account, so they cannot execute in parallel and the block takes them in FEE ORDER -- bid higher on the wallets you most want filled first. Delete this list to use the single key in FIRSTFILL_SOLANA_KEY with snipe.amountIn below.",
+    "wallets": [
+      {
+        "label": "w1",
+        "keyEnv": "SNIPE_WALLET_1",
+        "amountIn": "150000000"
+      },
+      {
+        "label": "w2",
+        "keyEnv": "SNIPE_WALLET_2",
+        "amountIn": "80000000",
+        "computeUnitPriceMicroLamports": 80000000
+      },
+      {
+        "label": "w3",
+        "keyEnv": "SNIPE_WALLET_3",
+        "amountIn": "45000000"
+      }
+    ],
+    "_amount_comment": "Used ONLY when there is no wallets list above. Raw quote units, as a string. wSOL has 9 decimals, so 250000000 is 0.25 SOL.",
+    "amountIn": "250000000",
+    "_minout_comment": "Raw base units below which the swap must fail. THERE IS NO DEFAULT and there will not be one: \"0\" means you accept any fill at any price, which on a launch is a real choice but has to be yours. Applies to every wallet unless an entry sets its own.",
+    "minimumAmountOut": "0",
+    "_fee_comment": "computeUnitLimit is the CU ceiling for the whole transaction; computeUnitPriceMicroLamports is what you bid per CU for block space. THE DEFAULTS BELOW HAVE NOT BEEN MEASURED against a live DBC launch - read the CU actually used from the first fill and tighten them.",
+    "computeUnitLimit": 250000,
+    "computeUnitPriceMicroLamports": 1000000,
+    "_send_comment": "Endpoints to fire at. Every one gets the same signed bytes, so duplicates are still a single fill. Falls back to httpUrl when empty.",
+    "sendUrls": [],
+    "resendMs": 400,
+    "fireWindowMs": 30000,
+    "_url_comment": "Default to the solana section above when null. A fast endpoint matters more here than anywhere else in this repo.",
+    "httpUrl": null,
+    "wsUrl": null
+  },
+  "pumpSniper": {
+    "_comment": "pump.fun launch sniper, driven by `npm run snipe-pump`. Five wallets buy ONE launch in a single Jito bundle. This is a DIFFERENT bot from the `snipe` block above, which is the Meteora DBC sniper \u2014 pump.fun and Meteora DBC are unrelated programs and neither sniper can trade the other's launches. THE KEYS ARE NEVER IN THIS FILE - wallet N reads FIRSTFILL_SNIPER_KEY_N from the environment, and a key found here is a startup failure. `mints` is OPTIONAL and normally left empty: the contract address arrives over Telegram with /target. Only one target at a time. totalSol is what you are declaring you will risk; startup refuses if the per-wallet amounts plus tip, rent and fees exceed it.",
     "rpcUrl": "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
     "wsUrl": "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
     "totalSol": "10",

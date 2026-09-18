@@ -1,7 +1,7 @@
 // Offline tests for the Robinhood Chain trade classifier. No chain, no RPC.
 
 import assert from 'node:assert/strict';
-import { erc20Deltas, classifyRhTrade, isRhTrade, TRANSFER_TOPIC } from './src/robinhood-trade.mjs';
+import { erc20Deltas, classifyRhTrade, isRhTrade, venueTouched, TRANSFER_TOPIC } from './src/robinhood-trade.mjs';
 
 let pass = 0;
 const ok = (n) => { console.log(`  ok  ${n}`); pass++; };
@@ -97,6 +97,193 @@ console.log('\nrobinhood classifier');
   assert.deepEqual(erc20Deltas(rcpt([xfer(TWINE, RELAYER, TARGET, 1n)]), ''), []);
   assert.equal(classifyRhTrade(null, TARGET).side, null);
   ok('empty, malformed and ownerless inputs yield nothing rather than throwing');
+}
+
+
+// ---------------------------------------------------------------------------
+console.log('\na transfer into the wallet is not a buy');
+
+{
+  // THE LIVE FALSE POSITIVE, 2026-09-17. Two alerts fired as "BUY on Robinhood
+  // Chain" for transactions whose selector was plain ERC-20 transfer(), sending a
+  // token INTO the watched wallet. Nothing was bought, and they never showed as
+  // trades on his profile because they are not trades.
+  const TOKEN = '0x08ae92d3afa1a3e20a4ab738a8d8ecf0e644c5f1';
+  const HIM = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+  const SOMEONE = '0x1111111111111111111111111111111111111111';
+  const pad = (a) => '0x' + '0'.repeat(24) + a.slice(2);
+
+  const receipt = {
+    status: '0x1',
+    logs: [{
+      address: TOKEN,
+      topics: [TRANSFER_TOPIC, pad(SOMEONE), pad(HIM)],
+      data: '0x' + (12345n).toString(16).padStart(64, '0'),
+    }],
+  };
+
+  // Without the call, deltas alone read it as a buy — which is exactly what
+  // happened live, and is NOT a bug in the deltas: a real buy looks identical,
+  // because fomo pays from a pooled account and never moves quote through his
+  // wallet. The selector is the only thing that separates them.
+  const blind = classifyRhTrade(receipt, HIM);
+  assert.equal(blind.side, 'buy');
+
+  const seen = classifyRhTrade(receipt, HIM, undefined, { to: TOKEN, selector: '0xa9059cbb' });
+  assert.equal(seen.side, 'transfer');
+  assert.equal(seen.direction, 'in');
+  assert.equal(seen.token, TOKEN);
+  assert.equal(seen.amount, 12345n);
+  assert.equal(isRhTrade(seen), false, 'a transfer must never be copied');
+  ok('a direct transfer() into the wallet reads as a transfer, not a buy');
+}
+{
+  const TOKEN = '0x08ae92d3afa1a3e20a4ab738a8d8ecf0e644c5f1';
+  const HIM = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+  const pad = (a) => '0x' + '0'.repeat(24) + a.slice(2);
+  const receipt = {
+    status: '0x1',
+    logs: [{
+      address: TOKEN,
+      topics: [TRANSFER_TOPIC, pad(HIM), pad('0x2222222222222222222222222222222222222222')],
+      data: '0x' + (999n).toString(16).padStart(64, '0'),
+    }],
+  };
+  const out = classifyRhTrade(receipt, HIM, undefined, { to: TOKEN, selector: '0x23b872dd' });
+  assert.equal(out.side, 'transfer');
+  assert.equal(out.direction, 'out');
+  assert.equal(isRhTrade(out), false);
+  ok('transferFrom out of the wallet is a transfer, not a sell');
+}
+{
+  // AND THE REAL BUY MUST STILL READ AS A BUY. His first confirmed Robinhood
+  // Chain buy had no quote leg at all -- one token inbound, nothing out -- so a
+  // fix that demanded a quote leg would have silently stopped copying him.
+  const TWINE = '0x3333333333333333333333333333333333333333';
+  const HIM = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+  const pad = (a) => '0x' + '0'.repeat(24) + a.slice(2);
+  const receipt = {
+    status: '0x1',
+    logs: [{
+      address: TWINE,
+      topics: [TRANSFER_TOPIC, pad('0x4444444444444444444444444444444444444444'), pad(HIM)],
+      data: '0x' + (298050709030000000000000n).toString(16).padStart(64, '0'),
+    }],
+  };
+  const buy = classifyRhTrade(receipt, HIM, undefined, { to: '0xccc88a9d00000000000000000000000000c315be', selector: '0x3593564c' });
+  assert.equal(buy.side, 'buy', 'a router call with a token inbound is still a buy');
+  assert.equal(isRhTrade(buy), true);
+  ok('a real router buy with no quote leg still reads as a buy');
+}
+
+{
+  // A token contract handing tokens out by some OTHER method -- a claim, a mint,
+  // a vesting release. The selector rule cannot see these, but the target can:
+  // you do not buy a token by calling the token.
+  const TOKEN = '0x08ae92d3afa1a3e20a4ab738a8d8ecf0e644c5f1';
+  const HIM = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+  const pad = (a) => '0x' + '0'.repeat(24) + a.slice(2);
+  const receipt = {
+    status: '0x1',
+    logs: [{
+      address: TOKEN,
+      topics: [TRANSFER_TOPIC, pad('0x0000000000000000000000000000000000000000'), pad(HIM)],
+      data: '0x' + (777n).toString(16).padStart(64, '0'),
+    }],
+  };
+  // Some arbitrary claim selector, not a transfer one.
+  const t = classifyRhTrade(receipt, HIM, undefined, { to: TOKEN, selector: '0x4e71d92d' });
+  assert.equal(t.side, 'transfer');
+  assert.equal(t.why, 'target-is-the-token-itself');
+  assert.equal(isRhTrade(t), false);
+  ok('a claim on the token contract is not a buy, whatever the selector');
+}
+{
+  // The real buy goes through a ROUTER, so its target is not the token -- it must
+  // still read as a buy. This is the case the target rule must not break.
+  const TWINE = '0xe27501d787d647cc82a5b4a7eafd5750386f1b77';
+  const HIM = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+  const pad = (a) => '0x' + '0'.repeat(24) + a.slice(2);
+  const receipt = {
+    status: '0x1',
+    logs: [{
+      address: TWINE,
+      topics: [TRANSFER_TOPIC, pad('0x4444444444444444444444444444444444444444'), pad(HIM)],
+      data: '0x' + (298050709030000000000000n).toString(16).padStart(64, '0'),
+    }],
+  };
+  const t = classifyRhTrade(receipt, HIM, undefined, { to: '0xccc88a9d00000000000000000000000000c315be', selector: '0x3593564c' });
+  assert.equal(t.side, 'buy');
+  assert.equal(isRhTrade(t), true);
+  ok('a router buy is untouched by the target rule');
+}
+
+
+// ---------------------------------------------------------------------------
+console.log('\nthe venue whitelist');
+
+const HIM2 = '0xb054643d9446d778511be5ed8f46d349b8ecc2c0';
+const MEME2 = '0xe27501d787d647cc82a5b4a7eafd5750386f1b77';
+const ROUTER = '0xccc88a9d00000000000000000000000000c315be';
+const ENTRYPOINT = '0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789';
+const pad2 = (a) => '0x' + '0'.repeat(24) + a.slice(2);
+const VENUES = new Set([ROUTER]);
+
+const arrival = (extraLogs = []) => ({
+  status: '0x1',
+  logs: [
+    { address: MEME2, topics: [TRANSFER_TOPIC, pad2('0x4444444444444444444444444444444444444444'), pad2(HIM2)], data: '0x' + (1000n).toString(16).padStart(64, '0') },
+    ...extraLogs,
+  ],
+});
+
+{
+  // The real shape: bundler-sent, so the TARGET is an entry point rather than the
+  // router — but the router still emits, which is why log emitters are checked.
+  const receipt = arrival([{ address: ROUTER, topics: ['0xdeadbeef'], data: '0x' }]);
+  const t = classifyRhTrade(receipt, HIM2, undefined, { to: ENTRYPOINT, selector: '0x3593564c' }, VENUES);
+  assert.equal(t.side, 'buy');
+  assert.equal(t.venue, ROUTER);
+  assert.equal(isRhTrade(t), true);
+  ok('a buy through a known venue is copied, even when the target is a bundler');
+}
+{
+  // The same arrival with NO known venue anywhere. This is an airdrop — or the
+  // router just moved. Reported, never copied.
+  const t = classifyRhTrade(arrival(), HIM2, undefined, { to: '0x9999999999999999999999999999999999999999', selector: '0xabcdef12' }, VENUES);
+  assert.equal(t.side, 'received');
+  assert.equal(t.why, 'no-known-venue');
+  assert.equal(t.token, MEME2);
+  assert.equal(t.amount, 1000n);
+  assert.equal(isRhTrade(t), false, 'an unrecognised arrival must never be copied');
+  ok('a token arriving with no known venue is received, not bought');
+}
+{
+  // Whitelist off = the old behaviour, unchanged. Opting in must be a choice.
+  const t = classifyRhTrade(arrival(), HIM2, undefined, { to: '0x9999999999999999999999999999999999999999', selector: '0xabcdef12' }, null);
+  assert.equal(t.side, 'buy', 'with no whitelist the classifier behaves exactly as before');
+  assert.equal(classifyRhTrade(arrival(), HIM2, undefined, null, new Set()).side, 'buy');
+  ok('an empty or absent whitelist changes nothing');
+}
+{
+  // The venue is matched case-insensitively — addresses arrive in both casings.
+  const receipt = arrival([{ address: ROUTER.toUpperCase().replace('0X', '0x'), topics: ['0x01'], data: '0x' }]);
+  const t = classifyRhTrade(receipt, HIM2, undefined, { to: ENTRYPOINT, selector: '0x01' }, VENUES);
+  assert.equal(t.side, 'buy');
+  ok('venue matching is case-insensitive');
+}
+{
+  // A transfer is refused BEFORE the whitelist is consulted: a direct transfer
+  // from a venue-adjacent contract is still not a purchase.
+  const t = classifyRhTrade(arrival([{ address: ROUTER, topics: ['0x01'], data: '0x' }]), HIM2, undefined, { to: MEME2, selector: '0xa9059cbb' }, VENUES);
+  assert.equal(t.side, 'transfer');
+  ok('the transfer rules still win over the whitelist');
+}
+{
+  assert.equal(venueTouched(arrival(), { to: ROUTER }, VENUES), ROUTER, 'the target counts as a venue');
+  assert.equal(venueTouched(arrival(), { to: ENTRYPOINT }, VENUES), null);
+  assert.equal(venueTouched(arrival(), null, null), null, 'no whitelist, no match');
+  ok('venueTouched checks the target and every log emitter');
 }
 
 console.log(`\n${pass} passed\n`);

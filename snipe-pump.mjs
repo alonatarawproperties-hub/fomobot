@@ -29,17 +29,17 @@ const log = (level, msg, extra) =>
 
 function loadConfig() {
   const raw = JSON.parse(fs.readFileSync('./config.json', 'utf8'));
-  const s = raw.sniper;
-  if (!s) throw new Error('config: no "sniper" block. Copy the one in config.example.json.');
-  if (!s.rpcUrl || !s.wsUrl) throw new Error('config: sniper.rpcUrl and sniper.wsUrl are both required');
-  if (!Array.isArray(s.wallets) || s.wallets.length === 0) throw new Error('config: sniper.wallets is empty');
+  const s = raw.pumpSniper;
+  if (!s) throw new Error('config: no "pumpSniper" block. Copy the one in config.example.json.');
+  if (!s.rpcUrl || !s.wsUrl) throw new Error('config: pumpSniper.rpcUrl and pumpSniper.wsUrl are both required');
+  if (!Array.isArray(s.wallets) || s.wallets.length === 0) throw new Error('config: pumpSniper.wallets is empty');
   // mints is OPTIONAL — the target normally arrives over Telegram.
   for (const m of s.mints ?? []) {
     try { new PublicKey(m); } catch { throw new Error(`config: "${m}" is not a valid contract address`); }
   }
   if ((s.mints ?? []).length > 1) {
     throw new Error(
-      'config: sniper.mints holds more than one address. All five wallet budgets are spent on whichever ' +
+      'config: pumpSniper.mints holds more than one address. All five wallet budgets are spent on whichever ' +
       'launches first, so a second target would be armed against money already gone. Snipe one at a time.',
     );
   }
@@ -49,11 +49,11 @@ function loadConfig() {
 async function main() {
   const { sniper: cfg, telegram } = loadConfig();
 
-  const totalLamports = solStringToLamports(cfg.totalSol, 'config: sniper.totalSol');
-  const tipLamports = solStringToLamports(cfg.jitoTipSol, 'config: sniper.jitoTipSol');
+  const totalLamports = solStringToLamports(cfg.totalSol, 'config: pumpSniper.totalSol');
+  const tipLamports = solStringToLamports(cfg.jitoTipSol, 'config: pumpSniper.jitoTipSol');
   const slippageBps = BigInt(cfg.slippageBps ?? 500);
   let maxPreBuySol = cfg.maxPreBuySol ?? '0.000000001';
-  const maxPreBuyLamports = solStringToLamports(maxPreBuySol, 'config: sniper.maxPreBuySol');
+  const maxPreBuyLamports = solStringToLamports(maxPreBuySol, 'config: pumpSniper.maxPreBuySol');
 
   const wallets = loadSniperWallets(cfg.wallets, process.env);
   const split = auditSplit({
@@ -70,7 +70,7 @@ async function main() {
 
   if (!split.withinBudget) {
     throw new Error(
-      `config: the split needs ${SOL(split.required)} but sniper.totalSol declares ${SOL(totalLamports)} ` +
+      `config: the split needs ${SOL(split.required)} but pumpSniper.totalSol declares ${SOL(totalLamports)} ` +
       `— ${SOL(split.excess)} short. Each wallet also pays token-account rent and a signature fee, and one pays the tip.`,
     );
   }

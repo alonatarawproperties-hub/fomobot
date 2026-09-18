@@ -422,7 +422,7 @@ Needs Node 22+ (for the built-in WebSocket).
 ```sh
 npm install
 cp config.example.json config.json   # fill in Helius, Telegram, and the executor block
-npm test                             # 251 offline assertions, no network
+npm test                             # 333 offline assertions, no network
 npm run paper                        # detect + decide + simulate, sign nothing
 npm start
 ```
@@ -470,14 +470,248 @@ what the recorded entries are for, and it is what should decide sizing.
   works from the receipt rather than the feed sighting, which is why.
 - The calldata match is a substring test. It cannot produce a false negative, but
   an address appearing in unrelated calldata would be a false positive — which is
-  why `via` is recorded.
+  why `via` is recorded. **This happened live on 2026-09-17**: two transactions
+  alerted as `BUY on Robinhood Chain` were plain `transfer()` calls moving a token
+  INTO the watched wallet. Nothing was bought, and they never appeared as trades
+  on his profile because they are not trades. See below.
+- **A token arriving is not a purchase, and deltas cannot tell the difference.**
+  A real buy has no quote leg — fomo pays from a pooled account — so "token in,
+  nothing out" describes both a buy and a gift. The only thing that separates them
+  is the call: a swap goes through a router, and nobody buys a token by calling
+  `transfer()` on the token itself. The classifier now takes the top-level
+  selector and refuses to call `transfer` / `transferFrom` a trade. Being wrong
+  there costs a skipped signal rather than a purchase nobody asked for.
+- **Solana is fixed the same way, by a different signal.** There is no selector to
+  read, so `classifyTrade` asks whether any program outside Token / Token-2022 /
+  ATA / System / ComputeBudget / Memo was invoked at the TOP level. A swap always
+  reaches a venue; a transfer or an airdrop does not. Inner instructions are
+  ignored on purpose — a swap is *made of* token transfers, so reading those
+  would demote every real trade.
+- **The venue whitelist closes that, and is OFF by default.** `executor.venues`
+  lists contracts that count as trading venues. With it set, a purchase must go
+  through one; a token arriving any other way is `received` and never copied.
+  Matched against the transaction target AND every log emitter, because his
+  trades arrive via a bundler whose target is an entry point rather than a
+  router. **The addresses are deliberately not in the source**: fomo's router is
+  proprietary and redeployable, and a hardcoded one would stop copying real buys
+  the day it changed. Read them off a known-good buy with
+  `npm run find-venues -- <txHash>`.
+- **An unmatched arrival is loud, not silent.** "He was airdropped something" and
+  "fomo redeployed their router" look identical to the classifier, and only a
+  human can tell them apart — so the bot says so and names the transaction to run
+  `find-venues` on. Missing a buy while being told is survivable; missing one in
+  silence is not, which is the whole reason the whitelist is opt-in.
+- **WHAT IS STILL NOT CAUGHT WITHOUT IT, on either chain.** Two rules now refuse a "buy": a
+  `transfer`/`transferFrom` selector, and a transaction whose target is the token
+  that arrived. Neither sees a token arriving from a **third-party contract** —
+  an airdrop distributor, a vesting escrow, a rewards claim, a bridge. Those
+  invoke a contract that is not the token, so they still read as a buy.
+  Distinguishing them needs a whitelist of venues that count as trading, which is
+  not built: fomo's router is proprietary and can be redeployed, and a stale
+  whitelist would stop copying real buys silently. **So the classifier is better
+  than it was and is not airtight**, and with the executor live that gap is the
+  operator's to weigh.
 - **No Telegram control plane yet.** The bot talks; it does not listen. `/pause`,
   `/positions` and a force-exit are not built, so stopping it means stopping the
   process.
 
 ---
 
+## Sniping a Meteora launch
+
+A separate tool from the copy-trader above, for a different problem: a token whose
+**mint address is known before it launches**, on a Meteora Dynamic Bonding Curve.
+Nothing is being copied here. We are racing to be in the first block.
+
+```
+npm run snipe -- plan          print every address this will touch; touch nothing
+npm run snipe -- prepare       create and fund the account the buy spends from
+npm run snipe -- arm --dry     watch a real launch, build the buy, send nothing
+npm run snipe -- arm           watch, and buy the instant the pool exists
+```
+
+### Why it can be fast
+
+A DBC pool is tradeable the moment its `VirtualPool` account is written, and that
+account's address is a PDA of `(config, base mint, quote mint)`. So it is known
+while the pool is still nothing — and so is everything hanging off it:
+
+```
+pool           PDA["pool", config, bigger mint, smaller mint]
+base vault     PDA["token_vault", base mint, pool]
+quote vault    PDA["token_vault", quote mint, pool]
+our accounts   the usual associated-token-account derivation
+```
+
+Which means the entire transaction can be compiled and **signed before the token
+exists**. It is re-signed in the background whenever the blockhash rolls, so what
+remains at the moment of the launch is a socket write. The buy is 688 bytes — one
+packet, no lookup tables.
+
+Routing through Jupiter instead would repeat a mistake this repo already measured
+on the other chain: an aggregator cannot quote a pool it has not indexed, and
+indexing a new pool took **1 to 7 seconds** in the sample under "Catching a
+launch" above. The whole point is to be inside that window, so the swap goes
+straight at Meteora's program.
+
+### When the config cannot be known at all
+
+Some launchpads generate a **fresh config keypair per launch**, in the same bundle
+that creates the pool. Measured on bagr, 2026-09-16: `Keypair.generate()` per
+launch, with a UNIQUE index on `config_address` in their database asserting no two
+launches share one. Where that is true the pre-signed path is simply unavailable —
+not slower, unavailable — and `snipe.config` must be left `null`.
+
+Do not paste in a config read off some earlier token. The pool derived from it is
+a real address belonging to a different pool, and the snipe would be aimed at it.
+The bot detects this (the mint matches, the pool address does not), throws the
+plan away and rebuilds from the live pool rather than refusing — because refusing
+there means refusing to buy the right token at the only moment it can be bought.
+But it is wasted work mid-race, and the fix is to not arm with a stale config.
+
+What IS knowable in advance on such a launchpad, and worth setting, is everything
+that is constant across its launches: the quote mint and `baseTokenProgram`.
+`find-config` reads both off any earlier launch. With them set, the discovery path
+fetches **nothing** at fire time — the pool account arrives inside the trigger
+notification carrying its own config and both vaults.
+
+### Two triggers, because they fail differently
+
+| trigger | needs | carries | fails when |
+|---|---|---|---|
+| `accountSubscribe` on the derived pool | the config | nothing but "it exists" | the config is unknown |
+| `programSubscribe` + memcmp on `base_mint` | nothing | the pool's whole account | the provider disables it |
+
+Whichever speaks first wins and the other is ignored for that launch — a repeat is
+dropped, so both firing does not buy twice. The `programSubscribe` filter matches
+`base_mint` at byte 136 of a 424-byte account, which means the notification itself
+delivers the config and both vaults: on that path nothing has to be fetched after
+the trigger. **A wrong offset there would not throw.** It would watch nothing,
+forever, looking exactly like a launch that had not happened yet, which is why the
+test recomputes it from Meteora's IDL rather than trusting the number.
+
+### Several wallets, one launch
+
+A snipe can be split across wallets, each with its own size:
+
+```json
+"wallets": [
+  { "label": "w1", "keyEnv": "FIRSTFILL_SOLANA_KEY",   "amountIn": "150000000" },
+  { "label": "w2", "keyEnv": "FIRSTFILL_SOLANA_KEY_2", "amountIn": "80000000"  },
+  { "label": "w3", "keyEnv": "FIRSTFILL_SOLANA_KEY_3", "amountIn": "45000000"  }
+]
+```
+
+Keys are named, never stored: each entry gives the ENVIRONMENT VARIABLE holding
+that wallet's key. A key in the config file is a startup failure, as before.
+
+They share one subscription — the trigger is a property of the mint, not of who
+is buying — and they share the pool facts derived from it, so five wallets cost
+four PDA derivations rather than twenty. What is per-wallet is small: two token
+accounts, an amount, a signature.
+
+**Each wallet succeeds or fails on its own.** Three filling and two missing is a
+normal outcome, and `settled` reports every wallet by name with its state,
+signature and slot. Reporting one total would hide which wallets hold the token.
+
+A wallet short of wrapped quote or native SOL is **dropped at arm time with a
+warning**, not treated as fatal — four of five is still a snipe, and firing a
+fifth that cannot pay its own fee is not. Arming refuses only when no wallet is
+usable. `plan` reports the shortfall per wallet before you commit anything.
+
+Every wallet needs its own native SOL, not just its own wrapped balance: the
+token-account rent and the fee come out of plain lamports, about 0.0021 SOL plus
+the priority fee, per wallet.
+
+**Bidding, and why order is not random.** Wallets racing one launch all write the
+same pool account, so Solana cannot execute them in parallel — the block takes
+them in fee order. `computeUnitPriceMicroLamports` on a wallet overrides the
+global bid, which is how you decide which of your own wallets fills first when
+not all of them fit in the first block. Each wallet's native-SOL requirement
+follows its own bid, and `plan` prices every wallet separately rather than
+quoting one figure.
+
+The aggregate is barely affected by the internal order — the curve gets walked
+the same distance either way — so this matters when the block is contested and
+some of your wallets may not make it, not when all of them land.
+
+**What splitting does not do.** If the aim is to not read as one buyer, the bot
+cannot deliver that by itself. Five wallets buying one token in one block is
+itself a pattern, and funding them from one source links them in a single hop on
+any clustering tool. Different sizes help; common funding or synchronised timing
+does not. Independent funding paths are the part that matters, and they happen
+outside this repo.
+
+### Everything is checked against Meteora's own SDK
+
+`src/meteora/dbc.mjs` hand-rolls the swap rather than calling
+`@meteora-ag/dynamic-bonding-curve-sdk`, because the SDK's `buildSwap` fetches the
+pool and the config over RPC on every call — round trips inside the window we are
+trying to win. The SDK is still installed, as the **test oracle**: every constant
+is recomputed from its IDL, the PDAs are compared against its own derivation
+helpers over 40 mint pairs, and the finished instruction is compared byte for byte
+against one Anchor builds from the same IDL, all 15 accounts with their signer and
+writable flags.
+
+That caught a real bug on the first run: `payer` was marked writable and the IDL
+does not declare it `mut`. It would never have shown up in testing, because the
+payer is also the fee payer and ends up writable in the compiled message anyway.
+
+### What it refuses to do
+
+- **Arm without the money already in place.** The buy spends from an SPL token
+  account, so `prepare` wraps the SOL beforehand. Wrapping inside the snipe would
+  put three instructions and a rent payment in the hot path.
+- **Arm when the config quotes a different currency** than the one funded — the
+  derived pool would be a real address belonging to some other pool entirely.
+- **Fire at a pool that is not the one armed for.** The pool states its own mint,
+  config and vaults; all of them are compared before anything is sent, and a
+  mismatch refuses rather than retargeting.
+- **Pick a slippage floor.** `minimumAmountOut` has no default and will not get
+  one. `"0"` means "fill me at any price", which on a launch is a defensible
+  choice — but it has to be made out loud.
+
+### Known limits — read these before arming it
+
+- **None of this has been run against a live launch.** Every check above is
+  offline. The container this was built in cannot reach Solana RPC, `meteora.ag`
+  or `jup.ag` at all, so nothing here has touched mainnet. `plan` and `arm --dry`
+  exist to be run on the real box, against the real mint, before any money is on
+  the line.
+- **The latency is unmeasured.** The design removes work from the hot path; it
+  does not prove a number. There is no figure here comparable to the 1,344ms
+  measured for the EVM path, and there will not be until it runs on the VM.
+- **The compute budget defaults are guesses.** 250,000 CU and 1,000,000
+  micro-lamports per CU are placeholders. Read what the first fill actually used
+  and tighten both — the priority fee is paid on a failed transaction too.
+- **There is no exit.** Same as the rest of this repo: it buys and holds. Selling
+  is manual.
+- **Sniping the first block does not mean a good fill.** Being first on a bonding
+  curve means the highest price on it. That is a strategy decision this tool does
+  not make and cannot improve.
+- **The fee schedule is aimed at you, and it is not small.** A DBC config can set
+  a base fee that starts at `cliff_fee_numerator` — its highest value — and steps
+  down over time. Period 0 is the launch instant, so a first-block buyer pays the
+  maximum by construction. `find-config` prints the real schedule off any earlier
+  launch by the same launchpad, including what waiting would have saved. **Read it
+  before deciding the race is worth running**, because on some configs the
+  anti-sniper fee costs more than the latency wins.
+- **`programSubscribe` is not universally available.** Some providers disable it,
+  and some refuse `processed` on it. If it is refused, the run says so and the
+  launch rests entirely on `accountSubscribe` — which needs the config. Without a
+  config and without `programSubscribe`, there is no trigger at all.
+- **One mint per process.** Arming is per-token by design; two launches means two
+  processes.
+
+---
+
 ## The pump.fun sniper
+
+> Not the same bot as the Meteora DBC sniper above. pump.fun's bonding curve
+> (`6EF8rrec…wF6P`) and Meteora's DBC (`dbcij3LW…SMaqN`) are unrelated programs
+> with different account layouts and different instructions, so **neither sniper
+> can trade the other's launches**. They share this repo, the wallet rules and
+> the Telegram poll loop, and nothing else.
 
 A second, separate bot: `npm run snipe`. Five wallets buy one pump.fun launch in
 a single Jito bundle, at contract addresses known in advance. It shares nothing
@@ -729,6 +963,8 @@ Each has a dedicated offline regression suite. Run it before and after.
 | `src/aggregator.mjs` | `node test-aggregator.mjs` |
 | `src/executor.mjs`, `src/executor-io.mjs`, the wiring in `index.mjs` | `node test-executor.mjs` |
 | `src/control.mjs`, `src/control-io.mjs`, `src/roster-edit.mjs` | `node test-control.mjs` |
+| `src/meteora/dbc.mjs` | `node test-meteora.mjs` |
+| `src/meteora/snipe.mjs`, `src/meteora/sniper.mjs`, `src/meteora/prepare.mjs` | `node test-sniper.mjs` |
 | `src/pump/pump.mjs`, `src/pump/wallets.mjs`, `src/pump/jito.mjs`, `src/pump/sniper.mjs`, `src/pump/snipe-control.mjs` | `node test-pump.mjs` |
 
 `npm test` runs a syntax check across every file first — two syntax errors have

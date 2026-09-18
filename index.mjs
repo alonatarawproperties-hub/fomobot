@@ -185,6 +185,33 @@ const serialise = (fn) => {
   return next.finally(() => { execStats.queued--; });
 };
 
+/**
+ * Contracts that count as a trading venue on Robinhood Chain.
+ *
+ * OPT-IN, and empty by default. With no list the classifier behaves as before:
+ * a token arriving is a buy unless a transfer rule refuses it. With a list, a
+ * purchase must go THROUGH one of these, and an arrival that does not is
+ * reported rather than copied.
+ *
+ * The addresses are not shipped in the source on purpose — fomo's router is
+ * proprietary and redeployable, so a hardcoded one would stop copying real buys
+ * the day it changed. Read them off a known-good buy with scripts/find-venues.mjs.
+ */
+const RH_VENUES = new Set(
+  (config.executor?.venues ?? []).map((v) => String(v).toLowerCase()),
+);
+if (RH_VENUES.size) {
+  log('info', 'venue whitelist active', {
+    venues: [...RH_VENUES],
+    meaning: 'a token arriving outside these is reported, never copied',
+  });
+} else {
+  log('warn', 'no venue whitelist', {
+    meaning: 'a token arriving from any contract that is not the token itself reads as a buy',
+    fix: 'run scripts/find-venues.mjs on a known buy and set executor.venues',
+  });
+}
+
 const solEntries = config.roster.filter((e) => e.solana && e.enabled !== false);
 const solByAddress = new Map(solEntries.map((e) => [e.solana, e.handle ?? e.solana.slice(0, 6)]));
 
@@ -275,9 +302,14 @@ async function handleRhSignal(sig) {
     return;
   }
 
-  const trade = classifyRhTrade(receipt, sig.trader);
+  // The selector matters: a plain ERC-20 transfer moves a token into the wallet
+  // and is indistinguishable from a buy by deltas alone, because fomo pays from a
+  // pooled account and a real buy has no quote leg either.
+  const trade = classifyRhTrade(receipt, sig.trader, undefined, { to: sig.to, selector: sig.selector }, RH_VENUES);
   recorder.write({
-    kind: isRhTrade(trade) ? 'trade' : trade.side === 'funding' ? 'funding' : 'non-trade',
+    kind: isRhTrade(trade) ? 'trade' : trade.side === 'funding' ? 'funding'
+      : trade.side === 'transfer' ? 'transfer' : trade.side === 'received' ? 'received' : 'non-trade',
+    venue: trade.venue ?? null, why: trade.why ?? null,
     chain: 'robinhood', handle: sig.handle, wallet: sig.trader, txHash: sig.txHash,
     side: trade.side, direction: trade.direction ?? null, token: trade.token,
     amount: trade.amount?.toString() ?? null, seenAt: sig.seenAt, classifiedAt: Date.now(),
@@ -286,6 +318,24 @@ async function handleRhSignal(sig) {
   if (!isRhTrade(trade)) {
     if (trade.side === 'funding') {
       notifier.send(`\u{1F4B5} <b>${esc(sig.handle)}</b> funding ${trade.direction} on Robinhood Chain \u2014 no token traded`);
+    } else if (trade.side === 'received') {
+      // LOUD ON PURPOSE. A token arrived through a contract we do not recognise.
+      // That is either an airdrop -- fine, ignore it -- or fomo's router has been
+      // redeployed and every real buy is about to stop being copied. The two look
+      // identical from here, and only a human can tell them apart, so this asks.
+      notifier.send(
+        `\u{2757} <b>${esc(sig.handle)}</b> received a token through an UNKNOWN contract\n`
+        + `<code>${esc(trade.token)}</code>\n`
+        + `NOT copied, because no known venue was involved.\n`
+        + `If this was a real buy, fomo's router has changed \u2014 run find-venues on `
+        + `<code>${esc(sig.txHash)}</code> and update executor.venues, or buys will keep being skipped.`,
+      );
+    } else if (trade.side === 'transfer') {
+      notifier.send(
+        `\u{1F4E6} <b>${esc(sig.handle)}</b> token transfer ${trade.direction} on Robinhood Chain \u2014 NOT a buy\n`
+        + `<code>${esc(trade.token)}</code>\n`
+        + `a direct <code>${esc(trade.selector)}</code> call, not a swap \u2014 nothing was bought`,
+      );
     }
     return;
   }
@@ -510,7 +560,7 @@ if (solEntries.length) {
     const lagMs = e.enrichedAt - e.seenAt;
     log('signal', 'solana classified', { handle, side: t.side, mint: t.mint, lagMs });
     recorder.write({
-      kind: t.side === 'funding' ? 'funding' : 'trade',
+      kind: t.side === 'funding' ? 'funding' : t.side === 'transfer' ? 'transfer' : 'trade',
       chain: 'solana', handle, wallet: e.address, signature: e.signature,
       slot: e.slot, side: t.side, direction: t.direction ?? null, mint: t.mint,
       amount: t.amount?.toString() ?? null, decimals: t.decimals,
@@ -526,6 +576,17 @@ if (solEntries.length) {
       notifier.send(
         `💵 <b>${handle}</b> funding ${t.direction}\n` +
         `<code>${pretty}</code> — no token traded`
+      );
+      return;
+    }
+
+    if (t.side === 'transfer') {
+      // A token arrived or left without a venue being invoked. Visible, because
+      // it is real movement — but never dressed up as a trade.
+      notifier.send(
+        `📦 <b>${handle}</b> token transfer ${t.direction} — NOT a buy\n` +
+        `<code>${t.mint}</code>\n` +
+        `amount <code>${pretty}</code> — no swap venue in the transaction`
       );
       return;
     }
