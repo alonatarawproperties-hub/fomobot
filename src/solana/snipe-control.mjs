@@ -100,6 +100,40 @@ export function decideSnipeCommand(parsed, snap) {
       if (snap.mode === 'paper') return { action: 'none', reply: '\u{1F4C4} Already PAPER.' };
       return { action: 'paper', reply: '\u{1F4C4} <b>PAPER</b>\nNothing will be signed or sent.' };
 
+    case 'maxprebuy': {
+      const v = parsed.args?.[0];
+      if (!v) {
+        return {
+          action: 'none',
+          reply: `Currently <b>${snap.maxPreBuySol ?? '?'} SOL</b>.\n\n`
+            + 'This is how much SOL a bonding curve may ALREADY hold and still be sniped. '
+            + 'A fresh launch holds 0, so a low number means "only buy a launch nobody has touched".\n\n'
+            + 'Raise it to fire on a token that is already trading — which is how you rehearse '
+            + 'without waiting for a launch.\n\n'
+            + 'Usage: <code>/maxprebuy 1000</code>',
+        };
+      }
+      if (!/^\d+(\.\d{1,9})?$/.test(v) || Number(v) <= 0) {
+        return { action: 'none', reply: `\u26A0\uFE0F <code>${escapeHtml(v)}</code> is not a positive SOL amount.` };
+      }
+      if (snap.armed) {
+        return {
+          action: 'none',
+          reply: '\u26A0\uFE0F Disarm first — this decides what gets bought, and changing it '
+            + 'under a live subscription changes the rules mid-launch.',
+        };
+      }
+      return {
+        action: 'set-maxprebuy',
+        payload: v,
+        reply: `\u2699\uFE0F Max pre-buy set to <b>${escapeHtml(v)} SOL</b>.\n\n`
+          + (Number(v) >= 1
+            ? '\u26A0\uFE0F That is high enough to buy a curve someone has already run up. '
+              + 'Fine for a rehearsal — set it back before sniping a real launch.'
+            : 'Only a curve holding less than this will be bought.'),
+      };
+    }
+
     case 'abort':
       // One command that always lands somewhere safe, whatever the current
       // state. Someone reaching for this is not in a position to work out which
@@ -129,6 +163,8 @@ function helpText() {
     '/plan     — what the five buys will do to the curve',
     '/wallets  — addresses, budgets and live balances',
     '',
+    '/maxprebuy — how much SOL a curve may already hold (raise it to rehearse)',
+    '',
     '/live     — spend real SOL',
     '/paper    — rehearse, sign nothing',
     '/abort    — disarm AND switch to paper, whatever the state',
@@ -147,6 +183,7 @@ function statusText(s) {
     `size       ${SOL(s.buyTotalLamports ?? 0n)} across the split`,
     `slippage   ${Number(s.slippageBps ?? 0) / 100}%`,
     `fee        ${s.feeBasisPoints ?? '?'} bps (read from chain)`,
+    `maxprebuy  ${s.maxPreBuySol ?? '?'} SOL already in the curve`,
     '',
     `uptime     ${hrs}h ${mins}m`,
   ];

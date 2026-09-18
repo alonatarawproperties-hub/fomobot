@@ -52,7 +52,8 @@ async function main() {
   const totalLamports = solStringToLamports(cfg.totalSol, 'config: sniper.totalSol');
   const tipLamports = solStringToLamports(cfg.jitoTipSol, 'config: sniper.jitoTipSol');
   const slippageBps = BigInt(cfg.slippageBps ?? 500);
-  const maxPreBuyLamports = solStringToLamports(cfg.maxPreBuySol ?? '0.000000001', 'config: sniper.maxPreBuySol');
+  let maxPreBuySol = cfg.maxPreBuySol ?? '0.000000001';
+  const maxPreBuyLamports = solStringToLamports(maxPreBuySol, 'config: sniper.maxPreBuySol');
 
   const wallets = loadSniperWallets(cfg.wallets, process.env);
   const split = auditSplit({
@@ -156,6 +157,7 @@ async function main() {
     slippageBps,
     feeBasisPoints: sniper.global?.feeBasisPoints?.toString(),
     uptimeMs: Date.now() - startedAt,
+    maxPreBuySol,
     funded: balances.every((b) => b.sufficient),
     underfunded: balances.filter((b) => !b.sufficient).length,
     plan: preview.legs,
@@ -201,6 +203,10 @@ async function main() {
             );
             break;
           }
+          case 'set-maxprebuy':
+            maxPreBuySol = payload;
+            sniper.maxPreBuyLamports = solStringToLamports(payload, '/maxprebuy');
+            break;
           case 'disarm':
             await sniper.unwatch();
             break;

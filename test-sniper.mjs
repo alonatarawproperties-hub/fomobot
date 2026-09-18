@@ -687,7 +687,7 @@ const snap = (over = {}) => ({
   mode: 'paper', armed: false, target: null,
   wallets: [{ address: 'W1', budgetLamports: 2_600_000_000n, balance: 3_000_000_000n, sufficient: true }],
   buyTotalLamports: 9_550_000_000n, slippageBps: 500n, feeBasisPoints: '95',
-  uptimeMs: 3_600_000, funded: true, underfunded: 0, plan: [], ...over,
+  uptimeMs: 3_600_000, funded: true, underfunded: 0, plan: [], maxPreBuySol: '0.5', ...over,
 });
 const cmd = (line) => {
   const [head, ...args] = line.slice(1).split(/\s+/);
@@ -866,6 +866,39 @@ const cmd = (line) => {
   }
   assert.equal(r.on, true);
   ok('a refused configuration returns empty credentials, not the ones it rejected');
+}
+
+{
+  const r = decideSnipeCommand(cmd('/maxprebuy 1000'), snap());
+  assert.equal(r.action, 'set-maxprebuy');
+  assert.equal(r.payload, '1000');
+  // A high value means it will buy a curve somebody already ran up. Saying so is
+  // the difference between a deliberate rehearsal setting and one left behind.
+  assert.match(r.reply, /set it back/);
+  const low = decideSnipeCommand(cmd('/maxprebuy 0.5'), snap());
+  assert.equal(low.action, 'set-maxprebuy');
+  assert.ok(!/set it back/.test(low.reply));
+  ok('max pre-buy is settable, and a rehearsal-sized value warns to put it back');
+}
+{
+  assert.equal(decideSnipeCommand(cmd('/maxprebuy'), snap()).action, 'none');
+  assert.match(decideSnipeCommand(cmd('/maxprebuy'), snap()).reply, /Currently/);
+  for (const bad of ['abc', '-1', '0', '1e9']) {
+    const r = decideSnipeCommand(cmd(`/maxprebuy ${bad}`), snap());
+    assert.equal(r.action, 'none', `"${bad}" must not be accepted`);
+  }
+  // Same rule as mode: it decides what gets bought, so it cannot move under a
+  // live subscription.
+  const armed = decideSnipeCommand(cmd('/maxprebuy 1000'), snap({ armed: true }));
+  assert.equal(armed.action, 'none');
+  assert.match(armed.reply, /Disarm first/);
+  ok('a bare, malformed or mid-flight max pre-buy change is refused');
+}
+{
+  const r = decideSnipeCommand(cmd('/status'), snap({ maxPreBuySol: '1000' }));
+  assert.match(r.reply, /maxprebuy\s+1000 SOL/);
+  assert.match(decideSnipeCommand(cmd('/help'), snap()).reply, /maxprebuy/);
+  ok('status and help both surface the max pre-buy, so a left-behind value is visible');
 }
 
 console.log(`\n${pass} passed\n`);
