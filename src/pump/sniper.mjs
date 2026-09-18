@@ -1,4 +1,4 @@
-// pump.fun launch sniper: five wallets, one bundle, contract addresses known
+// pump.fun launch sniper: five wallets, ONE TRANSACTION, contract address known
 // in advance.
 //
 // Knowing the mint before the launch changes the architecture completely. The
@@ -15,14 +15,27 @@
 //      account
 //
 // So the hot path is: decode the account we were just handed, derive one PDA,
-// build, sign, submit. No RPC call stands between the launch and the bundle.
+// build, sign, submit. No RPC call stands between the launch and the send.
+//
+// WHY ONE TRANSACTION AND NOT A JITO BUNDLE. The first design put the five buys
+// in a bundle. Jito accepted every one of them — five relays, HTTP 200, a bundle
+// id — and then silently discarded them: status Invalid, never reaching Pending,
+// nothing on chain. That held for a 217-byte transaction containing nothing but
+// a tip, which rules out anything about what we were sending. A bundle delegates
+// atomicity to a block engine that can decline to forward it, and this one does.
+//
+// A single transaction needs nobody's permission. It applies completely or not
+// at all because the runtime enforces it, and it lands through ordinary RPC with
+// a priority fee. Five buys do not fit in 1232 bytes on their own — the fourth
+// is 1432 and the fifth will not compile — so an address lookup table carries
+// the shared accounts. That is the only reason lookup-table.mjs exists.
 //
 // The curve state is still re-read from the notification and the plan re-run if
 // it is not what we expected — being first is the plan, not an assumption.
 
 import { EventEmitter } from 'node:events';
 import {
-  ComputeBudgetProgram, PublicKey, SystemProgram,
+  ComputeBudgetProgram, PublicKey,
   TransactionMessage, VersionedTransaction,
 } from '@solana/web3.js';
 import {
@@ -32,26 +45,42 @@ import {
   buildBuyInstruction, createAtaIdempotentInstruction, planLadder,
   tokenProgramForMintAccount,
 } from './pump.mjs';
-import { MAX_BUNDLE_SIZE } from './jito.mjs';
+import { createLookupTable, lookupAddressesFor } from './lookup-table.mjs';
 import bs58 from 'bs58';
 
 /** Rent for a token account, in lamports. Held back from every wallet's budget. */
 export const ATA_RENT_LAMPORTS = 2_039_280n;
-/** Solana's per-signature fee. One signature per transaction here. */
+/** Solana's per-signature fee. This transaction carries one per wallet. */
 export const SIGNATURE_FEE_LAMPORTS = 5_000n;
 
-/** Dust-rehearsal caps. Structurally identical bundle, negligible size. */
-export const REHEARSAL_MAX_SOL_COST = 1_000_000n;   // 0.001 SOL
-export const REHEARSAL_TIP_LAMPORTS = 1_000_000n;   // 0.001 SOL
+/** Solana refuses any transaction over this, outright. */
+export const MAX_TRANSACTION_BYTES = 1232;
+
+/** How many buys fit in one transaction with a lookup table. Measured, not guessed. */
+export const MAX_WALLETS = 5;
+
+/**
+ * Compute units requested per buy.
+ *
+ * Measured on mainnet: a pump.fun buy plus its token-account create costs
+ * 88,000-99,000 units. 120,000 leaves headroom without over-requesting, which is
+ * not free — the priority fee is charged on the limit asked for, not the units
+ * actually burned.
+ */
+export const COMPUTE_UNITS_PER_BUY = 120_000;
+
+/** The runtime's ceiling for a single transaction. */
+export const MAX_COMPUTE_UNITS = 1_400_000;
+
+/** Dust rehearsal: one raw token unit under a 0.001 SOL cap. Same shape, no size. */
+export const REHEARSAL_MAX_SOL_COST = 1_000_000n;
 
 /**
  * How old a blockhash may be when we sign with it.
  *
  * Solana accepts a transaction for 150 slots after its blockhash — roughly 60
- * seconds. Past that the cluster does not delay it, it REJECTS it, and a Jito
- * bundle built from such transactions comes back `Invalid` having never
- * executed. 30s leaves room for the bundle to reach a leader and still be
- * inside the window.
+ * seconds. Past that the cluster does not delay it, it REJECTS it. 30s leaves
+ * room to reach a leader and still be inside the window.
  *
  * Measured the hard way: a run whose blockhash refresh had been failing for
  * twelve minutes fired a bundle that five relays accepted and no leader could
@@ -63,12 +92,9 @@ export class PumpSniper extends EventEmitter {
   /**
    * @param {object} opts
    * @param {import('@solana/web3.js').Connection} opts.connection
-   * @param {object}   opts.jito              JitoClient
-   * @param {object[]} opts.wallets           from loadSniperWallets, in bundle order
+   * @param {object[]} opts.wallets           from loadSniperWallets, in buy order
    * @param {string[]} opts.mints             target contract addresses
    * @param {bigint}   opts.slippageBps
-   * @param {bigint}   opts.tipLamports
-   * @param {number}   opts.tipWalletIndex    which wallet pays the Jito tip
    * @param {number}   opts.computeUnitLimit
    * @param {number}   opts.computeUnitPriceMicroLamports
    * @param {bigint}   opts.maxPreBuyLamports refuse if the curve already holds more than this
@@ -77,53 +103,48 @@ export class PumpSniper extends EventEmitter {
   constructor(opts) {
     super();
     const {
-      connection, jito, wallets,
-      slippageBps, tipLamports, mints = [], tipWalletIndex = wallets.length - 1,
+      connection, wallets,
+      slippageBps, mints = [],
       computeUnitLimit = 250_000, computeUnitPriceMicroLamports = 500_000,
       maxPreBuyLamports = 0n, paper = true, rehearse = false,
     } = opts;
 
     if (!connection) throw new Error('sniper: connection is required');
-    if (!jito) throw new Error('sniper: jito client is required');
     if (!Array.isArray(wallets) || wallets.length === 0) throw new Error('sniper: no wallets');
-    if (wallets.length > MAX_BUNDLE_SIZE) {
-      throw new Error(`sniper: ${wallets.length} wallets exceeds the ${MAX_BUNDLE_SIZE}-transaction bundle limit`);
+    // No longer a bundle-slot limit — a byte limit. Five buys compile to about a
+    // kilobyte with a lookup table; each further wallet costs ~153 bytes of
+    // message plus a 64-byte signature, against 1232 total.
+    if (wallets.length > MAX_WALLETS) {
+      throw new Error(`sniper: ${wallets.length} wallets will not fit in one transaction (max ${MAX_WALLETS})`);
     }
     // Deliberately allowed to be empty. The contract address is usually not
     // known when the process starts — that is the entire reason the Telegram
     // control plane exists — so "no target yet" is a normal state to boot into,
     // not an error. watch() is where a missing target becomes a refusal.
     if (mints !== undefined && !Array.isArray(mints)) throw new Error('sniper: mints must be an array');
-    if (tipWalletIndex < 0 || tipWalletIndex >= wallets.length) {
-      throw new Error(`sniper: tipWalletIndex ${tipWalletIndex} is outside the wallet list`);
-    }
 
     this.connection = connection;
-    this.jito = jito;
     this.wallets = wallets;
     this.mints = mints.map((m) => new PublicKey(m));
     this.slippageBps = slippageBps;
-    this.tipLamports = tipLamports;
-    this.tipWalletIndex = tipWalletIndex;
     this.computeUnitLimit = computeUnitLimit;
     this.computeUnitPriceMicroLamports = computeUnitPriceMicroLamports;
     this.maxPreBuyLamports = maxPreBuyLamports;
     this.paper = paper;
     /**
-     * Dust rehearsal. Fires the REAL path — same five transactions, same five
-     * fee payers, same 18-account buy, same ATA create, same tip placement, same
-     * single atomic bundle — but asks for one raw token unit instead of a real
-     * size. pump.fun's buy takes the exact token amount out, so one unit costs
-     * essentially nothing while remaining structurally identical.
+     * Dust rehearsal. Fires the REAL path — same transaction, same five signers,
+     * same 18-account buys, same token-account creates, same lookup table — but
+     * asks for one raw token unit per wallet instead of a real size. pump.fun's
+     * buy takes the exact token amount out, so one unit costs essentially
+     * nothing while the transaction stays structurally identical.
      *
-     * The point is to learn whether the bundle reaches the auction at all
-     * without putting half a SOL behind the question.
+     * It answers "does this land" without putting half a SOL behind the
+     * question.
      */
     this.rehearse = rehearse;
 
     this.global = null;
     this.buybackRecipients = [];
-    this.tipAccounts = [];
     this.blockhash = null;
     this.blockhashAt = 0;
     this.blockhashFailures = 0;
@@ -134,9 +155,12 @@ export class PumpSniper extends EventEmitter {
      *  most pump.fun mints are Token-2022, and assuming the classic program
      *  derives the wrong ATA and fails the buy. */
     this.tokenPrograms = new Map();
+    /** Built when a target is set. Five buys do not compile without it. */
+    this.lookupTable = null;
+    this.lookupTableAddress = null;
     /** Mints already acted on. A curve account is written on every trade, not
-     *  only at creation, so without this the second buy by anyone else would
-     *  re-fire the bundle. */
+     *  only at creation, so without this the next buy by anyone else would
+     *  re-fire us. */
     this.fired = new Set();
     this.armed = false;
   }
@@ -161,19 +185,11 @@ export class PumpSniper extends EventEmitter {
     if (buyback.length === 0) throw new Error('sniper: no pump.fun buyback fee recipients found on chain');
     this.buybackRecipients = buyback.map((a) => a.pubkey);
 
-    // Tip accounts come from the block engine rather than a constant: Jito
-    // rotates them, and a tip paid to a retired account buys nothing.
-    this.tipAccounts = await this.jito.getTipAccounts();
-    if (!Array.isArray(this.tipAccounts) || this.tipAccounts.length === 0) {
-      throw new Error('sniper: no Jito tip accounts available');
-    }
-
     await this.#refreshBlockhash();
     this.emit('primed', {
       feeBasisPoints: this.global.feeBasisPoints.toString(),
       feeRecipients: this.global.feeRecipients.length,
       buybackRecipients: this.buybackRecipients.length,
-      tipAccounts: this.tipAccounts.length,
       initialVirtualSolReserves: this.global.initialVirtualSolReserves.toString(),
       initialVirtualTokenReserves: this.global.initialVirtualTokenReserves.toString(),
     });
@@ -192,7 +208,7 @@ export class PumpSniper extends EventEmitter {
     };
   }
 
-  /** The legs, in bundle order, with each wallet's budget in lamports. */
+  /** The legs, in execution order, with each wallet's budget in lamports. */
   legs() {
     return this.wallets.map((w) => ({
       label: `w${w.index + 1}`,
@@ -215,9 +231,9 @@ export class PumpSniper extends EventEmitter {
   /**
    * Confirm each wallet can actually pay for its leg before anything is armed.
    *
-   * A wallet short by a lamport fails its transaction, and one failed
-   * transaction voids the whole bundle. Checking now turns that into a startup
-   * error instead of a missed launch.
+   * A wallet short by a lamport fails its
+   * buy makes the WHOLE transaction fail, so all five are lost. Checking now
+   * turns that into a startup error instead of a missed launch.
    */
   async checkBalances() {
     const addresses = this.wallets.map((w) => new PublicKey(w.address));
@@ -229,9 +245,14 @@ export class PumpSniper extends EventEmitter {
       // The priority fee is real lamports and was missing from this sum. At
       // 250k CU and 500k microLamports/CU it is 125,000 lamports per wallet —
       // small, but a wallet that passes this check and then cannot pay fails its
-      // leg, and one failed leg voids the bundle for all five.
-      let required = w.budgetLamports + ATA_RENT_LAMPORTS + SIGNATURE_FEE_LAMPORTS + this.priorityFeeLamports();
-      if (i === this.tipWalletIndex) required += this.tipLamports;
+      // buy, and one failing instruction reverts the entire transaction.
+      // One transaction now, so ONE fee payer carries every signature and the
+      // whole priority fee. The other wallets pay only for their own buy and
+      // their own token account.
+      let required = w.budgetLamports + ATA_RENT_LAMPORTS;
+      if (i === 0) {
+        required += SIGNATURE_FEE_LAMPORTS * BigInt(this.wallets.length) + this.priorityFeeLamports();
+      }
       report.push({
         address: w.address, balance, required, sufficient: balance >= required,
         shortfall: balance >= required ? 0n : required - balance,
@@ -242,7 +263,12 @@ export class PumpSniper extends EventEmitter {
 
   /** What the compute budget instructions will actually cost, in lamports. */
   priorityFeeLamports() {
-    return (BigInt(this.computeUnitLimit) * BigInt(this.computeUnitPriceMicroLamports)) / 1_000_000n;
+    return (BigInt(this.computeUnits()) * BigInt(this.computeUnitPriceMicroLamports)) / 1_000_000n;
+  }
+
+  /** Total compute units this transaction will request. */
+  computeUnits() {
+    return Math.min(COMPUTE_UNITS_PER_BUY * this.wallets.length, MAX_COMPUTE_UNITS);
   }
 
   async #refreshBlockhash() {
@@ -304,75 +330,94 @@ export class PumpSniper extends EventEmitter {
    * is to exercise every step that can throw without producing anything
    * sendable.
    */
-  buildBundle({ mint, curve, planned, tokenProgram }) {
+  /**
+   * Build ONE transaction containing every wallet's buy.
+   *
+   * This is the redesign. A Jito bundle delegates atomicity to a block engine
+   * that can decline to forward it — and did, silently, every time: accepted by
+   * five relays, reported Invalid, never reaching the auction, even for a
+   * 217-byte transaction carrying nothing but a tip. One transaction needs
+   * nobody's permission. It applies completely or not at all because the runtime
+   * says so.
+   *
+   * The five buys still execute in order inside it, so planLadder is priced
+   * exactly as before: each leg quoted against the curve the one before it
+   * leaves behind.
+   */
+  buildTransaction({ mint, curve, planned, tokenProgram, lookupTable }) {
     if (!this.blockhash) throw new Error('sniper: no blockhash in hand');
     const age = Date.now() - this.blockhashAt;
     if (age > MAX_BLOCKHASH_AGE_MS) {
       throw new Error(
         `sniper: the blockhash is ${Math.round(age / 1000)}s old and a transaction is only valid for about 60s. ` +
-        'Signing it would produce a bundle every relay accepts and no leader can execute. ' +
-        'The refresh must be failing — check connectivity to the RPC.',
+        'Signing it would produce something no leader can execute. The refresh must be failing — check the RPC.',
       );
     }
     if (!tokenProgram) throw new Error('sniper: token program for the mint is unknown');
+    if (!lookupTable) {
+      throw new Error(
+        'sniper: no address lookup table. Five buys are 1432 bytes without one, past the 1232 limit, and the ' +
+        'fifth will not even compile. The table is built when the target is set.',
+      );
+    }
+
     const feeRecipient = this.#pick(this.global.feeRecipients);
     const buybackRecipient = this.#pick(this.buybackRecipients);
 
-    const transactions = [];
-    const built = [];
+    const instructions = [
+      ComputeBudgetProgram.setComputeUnitLimit({ units: this.computeUnits() }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.computeUnitPriceMicroLamports }),
+    ];
+
     for (const leg of planned.legs) {
-      const wallet = this.wallets[leg.index];
-      const buyer = wallet.keypair.publicKey;
-
-      const instructions = [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: this.computeUnitLimit }),
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.computeUnitPriceMicroLamports }),
-        createAtaIdempotentInstruction({ payer: buyer, owner: buyer, mint, tokenProgram }),
-        buildBuyInstruction({
-          mint,
-          buyer,
-          creator: curve.creator,
-          // One raw token unit, capped at 0.001 SOL. Everything else about the
-          // transaction is untouched, so what is tested is the submission path.
-          amountTokens: this.rehearse ? 1n : leg.requestTokens,
-          maxSolCost: this.rehearse ? REHEARSAL_MAX_SOL_COST : leg.maxSolCost,
-          feeRecipient,
-          buybackRecipient,
-          tokenProgram,
-        }),
-      ];
-
-      // The tip rides inside one of the five rather than as a sixth
-      // transaction: the bundle limit is five, and five wallets fills it.
-      if (leg.index === this.tipWalletIndex) {
-        instructions.push(SystemProgram.transfer({
-          fromPubkey: buyer,
-          toPubkey: new PublicKey(this.#pick(this.tipAccounts)),
-          lamports: Number(this.rehearse ? REHEARSAL_TIP_LAMPORTS : this.tipLamports),
-        }));
-      }
-
-      const message = new TransactionMessage({
-        payerKey: buyer,
-        recentBlockhash: this.blockhash.blockhash,
-        instructions,
-      }).compileToV0Message();
-
-      const tx = new VersionedTransaction(message);
-      // Serialising an unsigned v0 transaction still exercises message
-      // compilation, the account table and the size limit — everything that can
-      // reject a bundle before it is sent. Paper mode stops at the signature and
-      // returns no transaction, so there is nothing a later bug could submit.
-      if (this.paper) {
-        built.push({ leg, size: message.serialize().length, signed: false });
-        continue;
-      }
-      tx.sign([wallet.keypair]);
-      const serialized = Buffer.from(tx.serialize()).toString('base64');
-      transactions.push(serialized);
-      built.push({ leg, size: serialized.length, signed: true });
+      const buyer = this.wallets[leg.index].keypair.publicKey;
+      // Each wallet opens its own token account and funds its own buy; only the
+      // fee payer is charged the transaction fee.
+      instructions.push(createAtaIdempotentInstruction({ payer: buyer, owner: buyer, mint, tokenProgram }));
+      instructions.push(buildBuyInstruction({
+        mint,
+        buyer,
+        creator: curve.creator,
+        amountTokens: this.rehearse ? 1n : leg.requestTokens,
+        maxSolCost: this.rehearse ? REHEARSAL_MAX_SOL_COST : leg.maxSolCost,
+        feeRecipient,
+        buybackRecipient,
+        tokenProgram,
+      }));
     }
-    return { transactions, built, feeRecipient, buybackRecipient, paper: this.paper };
+
+    const message = new TransactionMessage({
+      payerKey: this.wallets[0].keypair.publicKey,
+      recentBlockhash: this.blockhash.blockhash,
+      instructions,
+    }).compileToV0Message([lookupTable]);
+
+    const signers = message.header.numRequiredSignatures;
+    const transaction = new VersionedTransaction(message);
+
+    // Paper compiles and measures — which exercises message assembly, the
+    // lookup table resolving and the size limit — then stops before producing
+    // anything sendable.
+    if (this.paper) {
+      return {
+        transaction: null, paper: true, signers, feeRecipient, buybackRecipient,
+        size: message.serialize().length + 1 + 64 * signers,
+        units: this.computeUnits(),
+      };
+    }
+
+    // EVERY wallet signs. A missing signature does not degrade the trade, it
+    // rejects the transaction — so all five buys are lost together, which is the
+    // atomicity working rather than breaking.
+    transaction.sign(this.wallets.map((w) => w.keypair));
+    const raw = transaction.serialize();
+    if (raw.length > MAX_TRANSACTION_BYTES) {
+      throw new Error(`sniper: transaction is ${raw.length} bytes, over the ${MAX_TRANSACTION_BYTES} limit`);
+    }
+    return {
+      transaction: raw, paper: false, signers, feeRecipient, buybackRecipient,
+      size: raw.length, units: this.computeUnits(),
+    };
   }
 
   /**
@@ -545,38 +590,52 @@ export class PumpSniper extends EventEmitter {
     }
 
     const { tokenProgram, cached } = await this.#resolveTokenProgram(mint);
-    const bundle = this.buildBundle({ mint, curve, planned, tokenProgram });
+    const built = this.buildTransaction({ mint, curve, planned, tokenProgram, lookupTable: this.lookupTable });
 
     if (this.paper) {
       this.emit('paper', {
         mint: key, slot: context?.slot ?? null,
-        transactions: bundle.built.length,
-        sizes: bundle.built.map((b) => b.size),
-        tokenProgram: tokenProgram.toBase58(),
-        tokenProgramCached: cached,
+        bytes: built.size, signers: built.signers, computeUnits: built.units,
+        tokenProgram: tokenProgram.toBase58(), tokenProgramCached: cached,
         elapsedMs: Date.now() - seenAt,
       });
       return;
     }
 
-    const result = await this.jito.sendBundle(bundle.transactions);
+    // skipPreflight: preflight is a simulation round trip in the hot path, and
+    // this transaction has already been checked — the ladder cannot over-ask,
+    // the size is verified at build, the balances were re-read at arm.
+    // maxRetries 0: we would rather know it failed than have the RPC quietly
+    // retry against a blockhash that is expiring.
+    const signature = await this.connection.sendRawTransaction(built.transaction, {
+      skipPreflight: true, maxRetries: 0, preflightCommitment: 'processed',
+    });
+
     this.emit('sent', {
-      mint: key, slot: context?.slot ?? null,
-      bundleId: result.bundleId, acceptedBy: result.acceptedBy,
+      mint: key, slot: context?.slot ?? null, signature,
+      bytes: built.size, signers: built.signers,
       blockhashAgeMs: Date.now() - this.blockhashAt,
       elapsedMs: Date.now() - seenAt,
       rehearsal: this.rehearse,
     });
 
-    // Accepted is not landed. Until this existed, the bot reported a bundle id
-    // and stopped, and every failure looked exactly like a success. Polling is
-    // what distinguishes a bundle dropped before the auction from one that was
-    // forwarded and lost — and that distinction is the whole diagnosis.
-    this.jito.pollBundle(result.bundleId)
-      .then((settled) => this.emit('settled', { mint: key, bundleId: result.bundleId, ...settled }))
-      .catch((err) => this.emit('warn', { at: 'pollBundle', error: err?.message ?? String(err) }));
+    // Sent is not landed. Reporting only the submission is what made three
+    // failed attempts look like three successes.
+    const { blockhash, lastValidBlockHeight } = this.blockhash;
+    this.connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, 'confirmed')
+      .then((res) => this.emit('settled', {
+        mint: key, signature,
+        landed: !res.value.err,
+        error: res.value.err ? JSON.stringify(res.value.err) : null,
+      }))
+      // A confirmation timeout is a failure to OBSERVE, not a failure to land.
+      // Reporting it as failure would have the operator resend something that
+      // already executed.
+      .catch((err) => this.emit('settled', {
+        mint: key, signature, landed: null, error: `unconfirmed: ${err?.message ?? err}`,
+      }));
 
-    return result;
+    return { signature };
   }
 
   /**
@@ -607,6 +666,9 @@ export class PumpSniper extends EventEmitter {
     this.mints = [mint];
     // A new target has not been bought yet, whatever the old one's state was.
     this.fired.delete(mint.toBase58());
+    // The old table holds the old mint's accounts and is useless for this one.
+    this.lookupTable = null;
+    this.lookupTableAddress = null;
     this.emit('target', { mint: mint.toBase58(), bondingCurve: deriveBondingCurve(mint).toBase58(), wasArmed });
     return mint;
   }
@@ -634,5 +696,45 @@ export class PumpSniper extends EventEmitter {
   /** The currently targeted mint, or null. */
   get target() {
     return this.mints.length ? this.mints[0].toBase58() : null;
+  }
+
+  /**
+   * Build the address lookup table for the current target.
+   *
+   * Kept out of setTarget because it costs several seconds and a little rent,
+   * and out of the fire path because it CANNOT live there: a table's entries are
+   * only usable in a slot later than the one that added them. That timing is the
+   * reason the contract address has to be known in advance, and why /target and
+   * /arm are separate steps rather than one.
+   */
+  async prepareLookupTable({ log = () => {} } = {}) {
+    if (!this.global) throw new Error('sniper: prime() has not run');
+    if (this.mints.length === 0) throw new Error('sniper: no target set');
+    const mint = this.mints[0];
+
+    const addresses = lookupAddressesFor({
+      mint,
+      wallets: this.wallets,
+      feeRecipients: this.global.feeRecipients,
+      buybackRecipients: this.buybackRecipients,
+    });
+    this.emit('lookupTable', { stage: 'building', mint: mint.toBase58(), addresses: addresses.length });
+
+    const address = await createLookupTable({
+      connection: this.connection,
+      payer: this.wallets[0].keypair,
+      addresses,
+      log,
+    });
+
+    const res = await this.connection.getAddressLookupTable(address, { commitment: 'confirmed' });
+    if (!res?.value) throw new Error(`sniper: lookup table ${address.toBase58()} is not readable after creation`);
+    this.lookupTable = res.value;
+    this.lookupTableAddress = address;
+    this.emit('lookupTable', {
+      stage: 'ready', mint: mint.toBase58(),
+      address: address.toBase58(), addresses: res.value.state.addresses.length,
+    });
+    return address;
   }
 }

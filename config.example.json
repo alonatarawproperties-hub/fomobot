@@ -89,7 +89,7 @@
     "wsUrl": null
   },
   "pumpSniper": {
-    "_comment": "pump.fun launch sniper, driven by `npm run snipe-pump`. Five wallets buy ONE launch in a single Jito bundle. This is a DIFFERENT bot from the `snipe` block above, which is the Meteora DBC sniper \u2014 pump.fun and Meteora DBC are unrelated programs and neither sniper can trade the other's launches. THE KEYS ARE NEVER IN THIS FILE - wallet N reads FIRSTFILL_SNIPER_KEY_N from the environment, and a key found here is a startup failure. `mints` is OPTIONAL and normally left empty: the contract address arrives over Telegram with /target. Only one target at a time. totalSol is what you are declaring you will risk; startup refuses if the per-wallet amounts plus tip, rent and fees exceed it.",
+    "_comment": "pump.fun launch sniper, driven by `npm run snipe-pump`. Five wallets buy ONE launch in ONE TRANSACTION - not a Jito bundle. Jito silently discarded every bundle we sent (accepted by five relays, status Invalid, never reaching the auction, even for a 217-byte transaction carrying nothing but a tip), so atomicity now comes from the Solana runtime instead: one transaction applies whole or not at all. Five buys need an address lookup table to fit in 1232 bytes; it is built when you /target and costs a little rent. There is no tip - outside a bundle a tip is a donation, not a bid. This is a DIFFERENT bot from the `snipe` block above, which is the Meteora DBC sniper. THE KEYS ARE NEVER IN THIS FILE - wallet N reads FIRSTFILL_SNIPER_KEY_N from the environment. `mints` is OPTIONAL and normally empty: the contract address arrives over Telegram with /target. computeUnitPriceMicroLamports is the priority fee bid; the unit LIMIT is computed from the wallet count (120,000 per buy) and is not configurable, because under-requesting it fails the whole transaction and over-requesting it just costs more.",
     "rpcUrl": "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
     "wsUrl": "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
     "totalSol": "10",
@@ -117,10 +117,7 @@
       }
     ],
     "slippageBps": 500,
-    "jitoTipSol": "0.005",
-    "tipWalletIndex": 4,
     "maxPreBuySol": "0.5",
-    "computeUnitLimit": 250000,
     "computeUnitPriceMicroLamports": 500000,
     "blockhashRefreshMs": 2000
   }

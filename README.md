@@ -794,11 +794,54 @@ curve — at a launch both are created in the same transaction, so the answer is
 normally cached before the trigger arrives. When it is not, one read resolves it,
 which is worth the round trip because the alternative is a guaranteed failure.
 
-### Five buys in one bundle move the curve against each other
+### One transaction, not a Jito bundle
 
-A Jito bundle executes its transactions in order, atomically, in one slot. That
-is what makes five wallets land together — and it is also all-or-nothing, so one
-reverting leg voids the other four fills.
+The first version put the five buys in a Jito bundle. Jito accepted every one —
+five relays, HTTP 200, a bundle id — and then silently discarded them all:
+status `Invalid`, never reaching `Pending`, nothing on chain. Three attempts,
+identical. Isolating it took stripping the submission to a 217-byte transaction
+containing **nothing but a tip**, which was also dropped. That rules out
+everything about what was being sent.
+
+What that taught, by probing Jito's ingress directly: a malformed bundle is
+rejected with HTTP **400 and a named reason** — "transaction is invalid", "must
+write lock at least one tip account", "exceeded maximum number of transactions".
+Getting a 200 and an id therefore proves signatures, tip presence, tip
+write-lock, transaction count and wire format are all correct. And an expired
+blockhash or an unfunded payer *also* returns 200 and an id before going
+`Invalid`, so that response carries no information at all.
+
+A bundle delegates atomicity to a block engine that can decline to forward it.
+**One transaction needs nobody's permission**: the runtime applies it whole or
+not at all, and it lands through ordinary RPC with a priority fee.
+
+Five buys do not fit in 1232 bytes on their own — measured:
+
+```
+              no lookup table    with lookup table
+  1 buy            787 bytes           356 bytes
+  3 buys          1217 bytes           662 bytes
+  4 buys          1432 OVER            815 bytes
+  5 buys     will not compile          968 bytes
+```
+
+So an address lookup table carries the 46 shared accounts, each costing one byte
+in the message instead of 32. The real transaction measures **1000 bytes**
+against the 1232 limit, with five signatures, built and signed in 29.8ms.
+
+Everything in the table is derivable from the contract address, which is known in
+advance — so it is built at `/target` and warm long before it is needed. It
+cannot be built at fire time: a table's entries are only usable in a *later slot*
+than the one that added them. The one exception is the creator vault, a PDA of
+the token's creator, which is unknowable until the curve exists; it stays a
+static key, which the byte budget has room for.
+
+There is no tip any more. Outside a bundle a tip is a donation, not a bid.
+
+### Five buys in one transaction move the curve against each other
+
+The five buys execute in order inside one transaction, and a transaction is
+all-or-nothing, so one reverting buy reverts the other four.
 
 Which means each leg has to be priced against the curve **the leg before it
 leaves behind**, not against the pre-launch state. Quoting all five against the

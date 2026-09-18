@@ -142,21 +142,26 @@ export function solStringToLamports(value, label) {
 /**
  * Check the split adds up to what the operator thinks they are risking.
  *
- * The buy budgets are not the whole outlay: one wallet also pays the Jito tip,
- * and every wallet pays rent for the token account it is about to open plus its
- * own signature fee. A split that sums to exactly the total leaves no room for
- * any of that, and the shortfall does not surface as a warning — the underfunded
- * transaction fails, and because the bundle is atomic it takes the other four
- * fills with it.
+ * The buy budgets are not the whole outlay. Every wallet pays rent for the token
+ * account it is about to open, and because all five buys ride in ONE transaction
+ * the fee payer alone carries every signature and the whole priority fee.
  *
- * Deliberately NOT enforced here: that the amounts differ from one another.
- * An uneven split is the operator's intent, not an invariant, and a bot that
- * refused five equal amounts would be inventing a rule nobody asked for. What
- * IS reported is whether they are distinguishable, so the choice is visible.
+ * A split that sums to exactly the total leaves nothing for any of that, and the
+ * shortfall does not surface as a warning — the underfunded buy fails, and one
+ * failing instruction reverts the entire transaction, so every other fill goes
+ * with it.
+ *
+ * Deliberately NOT enforced: that the amounts differ from one another. An uneven
+ * split is the operator's intent, not an invariant, and a bot that refused five
+ * equal amounts would be inventing a rule nobody asked for. What IS reported is
+ * whether they are distinguishable, so the choice stays visible.
  */
-export function auditSplit({ wallets, totalLamports, tipLamports, ataRentLamports, signatureFeeLamports }) {
+export function auditSplit({
+  wallets, totalLamports, ataRentLamports, signatureFeeLamports, priorityFeeLamports = 0n,
+}) {
   const buyTotal = wallets.reduce((sum, w) => sum + w.budgetLamports, 0n);
-  const overhead = BigInt(wallets.length) * (ataRentLamports + signatureFeeLamports) + tipLamports;
+  const signatures = signatureFeeLamports * BigInt(wallets.length);
+  const overhead = BigInt(wallets.length) * ataRentLamports + signatures + priorityFeeLamports;
   const required = buyTotal + overhead;
 
   const amounts = wallets.map((w) => w.budgetLamports);

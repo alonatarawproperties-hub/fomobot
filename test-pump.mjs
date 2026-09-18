@@ -25,9 +25,16 @@ import {
   loadSniperWallets, keypairFromBase58, solStringToLamports, auditSplit,
   MAX_BUNDLE_TRANSACTIONS,
 } from './src/pump/wallets.mjs';
-import { JitoClient, normaliseStatus, MAX_BUNDLE_SIZE } from './src/pump/jito.mjs';
+import { lookupAddressesFor, MAX_LOOKUP_ADDRESSES } from './src/pump/lookup-table.mjs';
+// The creator vault derivation is internal to pump.mjs; recompute it here so the
+// test asserts the real seed rather than trusting a comment.
+const deriveCreatorVaultForTest = (creator) =>
+  PublicKey.findProgramAddressSync([Buffer.from('creator-vault'), creator.toBuffer()], PUMP_PROGRAM)[0];
+import { AddressLookupTableAccount } from '@solana/web3.js';
+import { JitoClient, normaliseStatus } from './src/pump/jito.mjs';
 import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS, MAX_BLOCKHASH_AGE_MS,
-         REHEARSAL_MAX_SOL_COST, REHEARSAL_TIP_LAMPORTS } from './src/pump/sniper.mjs';
+         REHEARSAL_MAX_SOL_COST, MAX_TRANSACTION_BYTES, MAX_WALLETS,
+         COMPUTE_UNITS_PER_BUY } from './src/pump/sniper.mjs';
 import { decideSnipeCommand, resolveTelegram } from './src/pump/snipe-control.mjs';
 
 let pass = 0;
@@ -368,12 +375,12 @@ console.log('\nbudget arithmetic');
 {
   const wallets = LEGS.map((l) => ({ budgetLamports: l.budgetLamports }));
   const a = auditSplit({
-    wallets, totalLamports: 10_000_000_000n, tipLamports: 5_000_000n,
+    wallets, totalLamports: 10_000_000_000n, priorityFeeLamports: 300_000n,
     ataRentLamports: ATA_RENT_LAMPORTS, signatureFeeLamports: SIGNATURE_FEE_LAMPORTS,
   });
   assert.equal(a.buyTotal, 10_000_000_000n);
-  // The buys alone eat the whole 10 SOL, so rent, fees and the tip have nowhere
-  // to come from. This is the failure the audit exists to catch.
+  // The buys alone eat the whole 10 SOL, so rent, signatures and the priority
+  // fee have nowhere to come from. This is the failure the audit exists to catch.
   assert.equal(a.withinBudget, false);
   assert.ok(a.excess > 0n);
   assert.equal(a.allAmountsIdentical, false);
@@ -384,18 +391,18 @@ console.log('\nbudget arithmetic');
   const wallets = [2_500_000_000n, 1_300_000_000n, 2_000_000_000n, 1_000_000_000n, 2_700_000_000n]
     .map((b) => ({ budgetLamports: b }));
   const a = auditSplit({
-    wallets, totalLamports: 10_000_000_000n, tipLamports: 5_000_000n,
+    wallets, totalLamports: 10_000_000_000n, priorityFeeLamports: 300_000n,
     ataRentLamports: ATA_RENT_LAMPORTS, signatureFeeLamports: SIGNATURE_FEE_LAMPORTS,
   });
   assert.equal(a.buyTotal, 9_500_000_000n);
   assert.equal(a.withinBudget, true);
   assert.ok(a.headroom > 0n);
-  ok('holding back half a SOL leaves room for rent, signatures and the tip');
+  ok('holding back half a SOL leaves room for rent, signatures and the priority fee');
 }
 {
   const wallets = Array.from({ length: 5 }, () => ({ budgetLamports: 1_000_000_000n }));
   const a = auditSplit({
-    wallets, totalLamports: 10_000_000_000n, tipLamports: 5_000_000n,
+    wallets, totalLamports: 10_000_000_000n,
     ataRentLamports: ATA_RENT_LAMPORTS, signatureFeeLamports: SIGNATURE_FEE_LAMPORTS,
   });
   // Reported, never refused: an even split is legal, it is just visible.
@@ -407,7 +414,6 @@ console.log('\nbudget arithmetic');
 console.log('\njito bundling');
 
 {
-  assert.equal(MAX_BUNDLE_SIZE, 5);
   const j = new JitoClient({ fetchImpl: async () => { throw new Error('must not be called'); } });
   await assert.rejects(j.sendBundle([]), /empty bundle/);
   await assert.rejects(j.sendBundle(['a', 'b', 'c', 'd', 'e', 'f']), /exceeds the 5-transaction bundle limit/);
@@ -475,10 +481,10 @@ console.log('\nthe fire gate');
 {
   const w = mkWallet();
   const sniper = new PumpSniper({
-    connection: {}, jito: {},
+    connection: {},
     wallets: [{ index: 0, address: w.address, keypair: w.kp, budgetLamports: 1_000_000_000n }],
     mints: [Keypair.generate().publicKey.toBase58()],
-    slippageBps: 500n, tipLamports: 5_000_000n, maxPreBuyLamports: 0n, paper: true,
+    slippageBps: 500n, maxPreBuyLamports: 0n, paper: true,
   });
   const mint = sniper.mints[0];
   const fresh = { complete: false, realSolReserves: 0n };
@@ -495,23 +501,27 @@ console.log('\nthe fire gate');
 {
   const w = mkWallet();
   const base = {
-    connection: {}, jito: {},
+    connection: {},
     wallets: [{ index: 0, address: w.address, keypair: w.kp, budgetLamports: 1n }],
     mints: [Keypair.generate().publicKey.toBase58()],
-    slippageBps: 500n, tipLamports: 1n,
+    slippageBps: 500n,
   };
   assert.throws(() => new PumpSniper({ ...base, wallets: [] }), /no wallets/);
-  assert.throws(() => new PumpSniper({ ...base, tipWalletIndex: 3 }), /outside the wallet list/);
   assert.throws(() => new PumpSniper({ ...base, connection: null }), /connection is required/);
   assert.throws(() => new PumpSniper({ ...base, mints: 'not-an-array' }), /must be an array/);
-  ok('a sniper with no wallets, a tip from a wallet it lacks, or a non-array target will not construct');
+  // A sixth wallet is refused on BYTES now, not on bundle slots.
+  const six = Array.from({ length: 6 }, mkWallet)
+    .map((x, i) => ({ index: i, address: x.address, keypair: x.kp, budgetLamports: 1n }));
+  assert.throws(() => new PumpSniper({ ...base, wallets: six }), /will not fit in one transaction/);
+  assert.equal(MAX_WALLETS, 5);
+  ok('a sniper with no wallets, no connection, a bad target or a sixth wallet will not construct');
 }
 {
   const w = mkWallet();
   const base = {
-    connection: {}, jito: {},
+    connection: {},
     wallets: [{ index: 0, address: w.address, keypair: w.kp, budgetLamports: 1n }],
-    slippageBps: 500n, tipLamports: 1n,
+    slippageBps: 500n,
   };
   // Booting with no contract address is the NORMAL case: it usually arrives
   // later, over Telegram. It must not be an error until something tries to watch.
@@ -526,9 +536,9 @@ console.log('\nthe fire gate');
 {
   const w = mkWallet();
   const s = new PumpSniper({
-    connection: {}, jito: {},
+    connection: {},
     wallets: [{ index: 0, address: w.address, keypair: w.kp, budgetLamports: 1n }],
-    slippageBps: 500n, tipLamports: 1n, paper: true,
+    slippageBps: 500n, paper: true,
   });
   const mint = Keypair.generate().publicKey.toBase58();
   await s.setTarget(mint);
@@ -549,10 +559,10 @@ console.log('\nthe fire gate');
   // the fired-set this would re-fire on somebody else's buy.
   const w = mkWallet();
   const sniper = new PumpSniper({
-    connection: {}, jito: {},
+    connection: {},
     wallets: [{ index: 0, address: w.address, keypair: w.kp, budgetLamports: 1n }],
     mints: [Keypair.generate().publicKey.toBase58()],
-    slippageBps: 0n, tipLamports: 1n, maxPreBuyLamports: 10n ** 18n, paper: true,
+    slippageBps: 0n, maxPreBuyLamports: 10n ** 18n, paper: true,
   });
   const mint = sniper.mints[0];
   assert.equal(sniper.assess(mint, { complete: false, realSolReserves: 5n }).act, true);
@@ -564,9 +574,9 @@ console.log('\nthe fire gate');
 {
   const w = mkWallet();
   const s = new PumpSniper({
-    connection: {}, jito: {},
+    connection: {},
     wallets: [{ index: 0, address: w.address, keypair: w.kp, budgetLamports: 1n }],
-    slippageBps: 500n, tipLamports: 1n, paper: true,
+    slippageBps: 500n, paper: true,
   });
   assert.equal(s.setMode('live'), false);
   assert.equal(s.mode, 'live');
@@ -581,7 +591,7 @@ console.log('\nthe fire gate');
   ok('mode switches both ways but is refused while armed, so rules cannot change mid-launch');
 }
 
-console.log('\nbundle assembly');
+console.log('\ntransaction assembly');
 
 // Stand the sniper up with the chain-derived values injected, so the whole
 // build path runs with no network. These are the values mainnet actually holds.
@@ -590,9 +600,9 @@ function offlineSniper(overrides = {}) {
   const amounts = [2_600_000_000n, 1_350_000_000n, 2_150_000_000n, 1_050_000_000n, 2_400_000_000n];
   const wallets = ws.map((w, i) => ({ index: i, address: w.address, keypair: w.kp, budgetLamports: amounts[i] }));
   const s = new PumpSniper({
-    connection: {}, jito: {}, wallets,
+    connection: {}, wallets,
     mints: ['Hn6C4FTuyK9Z5jZeDsiCe5i6YG56a3LYyPKWoV6Dpump'],
-    slippageBps: 500n, tipLamports: 5_000_000n, maxPreBuyLamports: 500_000_000n,
+    slippageBps: 500n, maxPreBuyLamports: 500_000_000n,
     paper: false, ...overrides,
   });
   s.global = {
@@ -604,6 +614,20 @@ function offlineSniper(overrides = {}) {
   s.tipAccounts = [Keypair.generate().publicKey.toBase58()];
   s.blockhash = { blockhash: '11111111111111111111111111111111', lastValidBlockHeight: 1 };
   s.blockhashAt = Date.now();
+  // Every account the buys reference except the five signers. Without this the
+  // message is 1432 bytes at four buys and will not compile at five.
+  s.lookupTable = new AddressLookupTableAccount({
+    key: Keypair.generate().publicKey,
+    state: {
+      deactivationSlot: 2n ** 64n - 1n, lastExtendedSlot: 0, lastExtendedSlotStartIndex: 0,
+      authority: ws[0].kp.publicKey,
+      addresses: lookupAddressesFor({
+        mint: s.mints[0], wallets,
+        feeRecipients: s.global.feeRecipients,
+        buybackRecipients: s.buybackRecipients,
+      }),
+    },
+  });
   return s;
 }
 const CURVE = {
@@ -614,52 +638,50 @@ const CURVE = {
 
 {
   const s = offlineSniper();
-  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
-  assert.equal(b.transactions.length, 5);
-  // Solana refuses any transaction over 1232 bytes outright. Adding an
-  // instruction to the hot path is exactly how that limit gets crossed.
-  for (const tx of b.transactions) {
-    assert.ok(Buffer.from(tx, 'base64').length <= 1232, 'transaction exceeds the 1232-byte limit');
-  }
-  ok('all five transactions are built and every one fits inside the 1232-byte limit');
+  const b = s.buildTransaction({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM, lookupTable: s.lookupTable });
+  // ONE transaction carrying all five buys. That is what makes it atomic without
+  // a block engine: the runtime applies it whole or not at all.
+  assert.ok(b.transaction instanceof Uint8Array);
+  assert.equal(b.signers, 5);
+  assert.ok(b.size <= MAX_TRANSACTION_BYTES, `transaction is ${b.size} bytes, over the limit`);
+  ok('all five buys compile into ONE signed transaction inside the 1232-byte limit');
 }
 {
   const s = offlineSniper();
-  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
-  // Bundle order IS execution order, and execution order is what the ladder was
-  // priced against. If these ever disagree the later legs are mispriced.
-  b.transactions.forEach((b64, i) => {
-    const tx = VersionedTransaction.deserialize(Buffer.from(b64, 'base64'));
-    assert.equal(tx.message.staticAccountKeys[0].toBase58(), s.wallets[i].address);
-    assert.ok(tx.signatures.some((sg) => sg.some((byte) => byte !== 0)), 'transaction is unsigned');
-  });
-  ok('the bundle is signed and in wallet order, which is the order the ladder priced');
+  const b = s.buildTransaction({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM, lookupTable: s.lookupTable });
+  const tx = VersionedTransaction.deserialize(b.transaction);
+  // EVERY wallet signs. A missing signature rejects the transaction outright,
+  // which loses all five buys together — the atomicity working, not breaking.
+  assert.equal(tx.signatures.length, 5);
+  for (const sig of tx.signatures) assert.ok(sig.some((byte) => byte !== 0), 'a wallet did not sign');
+  // Wallet 1 pays the fee for everyone.
+  assert.equal(tx.message.staticAccountKeys[0].toBase58(), s.wallets[0].address);
+  ok('every wallet signs, and the first one carries the fee for all of them');
 }
 {
   const s = offlineSniper();
-  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
-  const counts = b.transactions.map((b64) =>
-    VersionedTransaction.deserialize(Buffer.from(b64, 'base64')).message.compiledInstructions.length);
-  // Four instructions each (2 compute budget, ATA, buy); the tip wallet has five.
-  assert.deepEqual(counts, [4, 4, 4, 4, 5]);
-  assert.equal(counts.filter((c) => c === 5).length, 1);
-  ok('exactly one transaction carries the Jito tip, and it is the configured one');
+  const b = s.buildTransaction({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM, lookupTable: s.lookupTable });
+  const tx = VersionedTransaction.deserialize(b.transaction);
+  // 2 compute-budget instructions, then a token-account create and a buy per
+  // wallet. No tip: outside a Jito bundle a tip is a donation, not a bid.
+  assert.equal(tx.message.compiledInstructions.length, 2 + 5 * 2);
+  assert.equal(b.units, COMPUTE_UNITS_PER_BUY * 5);
+  ok('the transaction is two compute-budget instructions plus a create and a buy per wallet');
 }
 {
   const s = offlineSniper({ paper: true });
-  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
-  // Paper must produce nothing sendable at all, not an unsigned transaction that
-  // some later code path could still hand to a relay.
-  assert.equal(b.transactions.length, 0);
-  assert.equal(b.built.length, 5);
+  const b = s.buildTransaction({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM, lookupTable: s.lookupTable });
+  // Paper must produce nothing sendable — not an unsigned transaction some later
+  // code path could still hand to an RPC.
+  assert.equal(b.transaction, null);
   assert.equal(b.paper, true);
-  assert.ok(b.built.every((x) => x.signed === false));
-  ok('paper mode builds and measures all five but emits nothing that could be sent');
+  assert.ok(b.size > 0 && b.size <= MAX_TRANSACTION_BYTES);
+  ok('paper compiles and measures the transaction but emits nothing that could be sent');
 }
 {
   const s = offlineSniper();
   s.blockhash = null;
-  assert.throws(() => s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM }), /no blockhash/);
+  assert.throws(() => s.buildTransaction({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM, lookupTable: s.lookupTable }), /no blockhash/);
   ok('building without a blockhash in hand throws instead of signing something unlandable');
 }
 {
@@ -670,18 +692,19 @@ const CURVE = {
   const s = offlineSniper();
   s.blockhashAt = Date.now() - (MAX_BLOCKHASH_AGE_MS + 1000);
   assert.throws(
-    () => s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM }),
+    () => s.buildTransaction({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM, lookupTable: s.lookupTable }),
     /blockhash is \d+s old/,
   );
-  ok('a blockhash past its shelf life refuses to build rather than signing a bundle nothing can execute');
+  ok('a blockhash past its shelf life refuses to build rather than signing something nothing can execute');
 }
 {
   const s = offlineSniper();
   // Just inside the window still builds — the guard must not be so tight that a
   // normal refresh interval trips it.
   s.blockhashAt = Date.now() - (MAX_BLOCKHASH_AGE_MS - 5_000);
-  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
-  assert.equal(b.transactions.length, 5);
+  const b = s.buildTransaction({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM, lookupTable: s.lookupTable });
+  assert.equal(b.signers, 5);
+  assert.ok(b.size <= MAX_TRANSACTION_BYTES);
   assert.ok(MAX_BLOCKHASH_AGE_MS < 60_000, 'the guard must be tighter than the cluster own expiry');
   ok('a blockhash inside the window still builds, and the window is tighter than the cluster');
 }
@@ -689,7 +712,7 @@ const CURVE = {
 {
   const s = offlineSniper();
   assert.throws(
-    () => s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE) }),
+    () => s.buildTransaction({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), lookupTable: s.lookupTable }),
     /token program for the mint is unknown/,
   );
   ok('building without a resolved token program throws rather than guessing the classic one');
@@ -718,60 +741,121 @@ const CURVE = {
   const s = offlineSniper();
   const mint = s.mints[0];
   const planned = s.plan(CURVE);
-  const a = s.buildBundle({ mint, curve: CURVE, planned, tokenProgram: TOKEN_PROGRAM });
-  const b = s.buildBundle({ mint, curve: CURVE, planned, tokenProgram: TOKEN_2022_PROGRAM });
-  const keysOf = (b64) => VersionedTransaction.deserialize(Buffer.from(b64, 'base64'))
-    .message.staticAccountKeys.map((k) => k.toBase58());
-  // The chosen program must actually reach the transaction, not just be accepted.
-  assert.ok(keysOf(a.transactions[0]).includes(TOKEN_PROGRAM.toBase58()));
-  assert.ok(keysOf(b.transactions[0]).includes(TOKEN_2022_PROGRAM.toBase58()));
-  assert.notDeepEqual(keysOf(a.transactions[0]), keysOf(b.transactions[0]));
-  ok('the resolved token program reaches the built transaction and changes its accounts');
+  const a = s.buildTransaction({ mint, curve: CURVE, planned, tokenProgram: TOKEN_PROGRAM, lookupTable: s.lookupTable });
+  const b = s.buildTransaction({ mint, curve: CURVE, planned, tokenProgram: TOKEN_2022_PROGRAM, lookupTable: s.lookupTable });
+  // With a lookup table the program is referenced by index, so compare the
+  // resolved address sets rather than the static keys.
+  const addrs = (x) => {
+    const m = VersionedTransaction.deserialize(x.transaction).message;
+    return [...m.staticAccountKeys.map((k) => k.toBase58()),
+            ...m.addressTableLookups.flatMap((l) => [...l.writableIndexes, ...l.readonlyIndexes])].join(',');
+  };
+  assert.notEqual(addrs(a), addrs(b));
+  ok('the resolved token program changes which accounts the transaction references');
 }
 
 {
   const s = offlineSniper();
-  // 250_000 CU x 500_000 microLamports/CU = 125_000 lamports. Omitting this from
-  // the balance check lets a wallet pass and then fail its leg, which voids the
-  // whole bundle because it is atomic.
-  assert.equal(s.priorityFeeLamports(), 125_000n);
-  ok('the priority fee is computed from the compute budget rather than ignored');
+  // One transaction covering five buys asks for 5 x 120_000 = 600_000 units, so
+  // at 500_000 microLamports/CU the priority fee is 300_000 lamports. Omitting it
+  // from the balance check lets the fee payer pass and then fail, which reverts
+  // every buy because they all ride the same transaction.
+  assert.equal(s.computeUnits(), COMPUTE_UNITS_PER_BUY * 5);
+  assert.equal(s.priorityFeeLamports(), 300_000n);
+  ok('the priority fee follows the compute budget the transaction actually requests');
 }
 {
   const plain = offlineSniper();
   const dust = offlineSniper({ rehearse: true });
   const planned = plain.plan(CURVE);
-  const a = plain.buildBundle({ mint: plain.mints[0], curve: CURVE, planned, tokenProgram: TOKEN_PROGRAM });
-  const b = dust.buildBundle({ mint: dust.mints[0], curve: CURVE, planned, tokenProgram: TOKEN_PROGRAM });
+  const a = plain.buildTransaction({ mint: plain.mints[0], curve: CURVE, planned, tokenProgram: TOKEN_PROGRAM, lookupTable: plain.lookupTable });
+  const b = dust.buildTransaction({ mint: dust.mints[0], curve: CURVE, planned, tokenProgram: TOKEN_PROGRAM, lookupTable: dust.lookupTable });
 
-  // Structurally identical: same count, same instruction counts, same order.
-  assert.equal(a.transactions.length, b.transactions.length);
-  const ixCounts = (bundle) => bundle.transactions.map((t) =>
-    VersionedTransaction.deserialize(Buffer.from(t, 'base64')).message.compiledInstructions.length);
-  assert.deepEqual(ixCounts(a), ixCounts(b));
-  ok('a rehearsal bundle has the same shape as the real one — it tests the same path');
+  // Structurally identical: same signers, same instructions, same size class.
+  assert.equal(a.signers, b.signers);
+  const ixOf = (x) => VersionedTransaction.deserialize(x.transaction).message.compiledInstructions.length;
+  assert.equal(ixOf(a), ixOf(b));
+  ok('a rehearsal transaction has the same shape as the real one — it tests the same path');
 }
 {
   const dust = offlineSniper({ rehearse: true });
-  const b = dust.buildBundle({ mint: dust.mints[0], curve: CURVE, planned: dust.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
-  // The buy is the 4th instruction; its data is discriminator + amount + cap.
-  const tx = VersionedTransaction.deserialize(Buffer.from(b.transactions[0], 'base64'));
-  const buyIx = tx.message.compiledInstructions[3];
-  const data = Buffer.from(buyIx.data);
+  const b = dust.buildTransaction({ mint: dust.mints[0], curve: CURVE, planned: dust.plan(CURVE), tokenProgram: TOKEN_PROGRAM, lookupTable: dust.lookupTable });
+  // Instruction 0 and 1 are compute budget; then create/buy per wallet, so the
+  // first buy is index 3.
+  const tx = VersionedTransaction.deserialize(b.transaction);
+  const data = Buffer.from(tx.message.compiledInstructions[3].data);
   assert.equal(data.readBigUInt64LE(8), 1n);                       // one raw token unit
   assert.equal(data.readBigUInt64LE(16), REHEARSAL_MAX_SOL_COST);  // capped at 0.001 SOL
-  assert.ok(REHEARSAL_TIP_LAMPORTS < 5_000_000n);
   ok('a rehearsal asks for one raw token unit under a 0.001 SOL cap, so it costs almost nothing');
 }
 {
   const plain = offlineSniper();
-  const b = plain.buildBundle({ mint: plain.mints[0], curve: CURVE, planned: plain.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
-  const tx = VersionedTransaction.deserialize(Buffer.from(b.transactions[0], 'base64'));
+  const b = plain.buildTransaction({ mint: plain.mints[0], curve: CURVE, planned: plain.plan(CURVE), tokenProgram: TOKEN_PROGRAM, lookupTable: plain.lookupTable });
+  const tx = VersionedTransaction.deserialize(b.transaction);
   const data = Buffer.from(tx.message.compiledInstructions[3].data);
   // And the real path must be untouched by the rehearsal plumbing.
   assert.notEqual(data.readBigUInt64LE(8), 1n);
   assert.equal(data.readBigUInt64LE(16), 2_600_000_000n);
   ok('the real path still asks for the planned size — rehearsal plumbing does not leak into it');
+}
+
+console.log('\nthe address lookup table');
+
+{
+  const ws = Array.from({ length: 5 }, mkWallet);
+  const mint = Keypair.generate().publicKey;
+  const fee = Array.from({ length: 8 }, () => Keypair.generate().publicKey);
+  const buyback = Array.from({ length: 8 }, () => Keypair.generate().publicKey);
+  const addrs = lookupAddressesFor({ mint, wallets: ws, feeRecipients: fee, buybackRecipients: buyback });
+  const set = new Set(addrs.map((a) => a.toBase58()));
+
+  assert.equal(set.size, addrs.length, 'the table must not repeat an address');
+  assert.ok(addrs.length <= MAX_LOOKUP_ADDRESSES);
+  // The signers must NOT be in the table: a signer has to stay a static key in
+  // the message, and putting it in the table would make the message invalid.
+  for (const w of ws) assert.ok(!set.has(w.address), 'a signer must not be in the lookup table');
+  ok('the table is deduplicated, within the limit, and excludes every signer');
+}
+{
+  const ws = Array.from({ length: 5 }, mkWallet);
+  const mint = Keypair.generate().publicKey;
+  const fee = [Keypair.generate().publicKey];
+  const addrs = lookupAddressesFor({ mint, wallets: ws, feeRecipients: fee, buybackRecipients: fee });
+  const set = new Set(addrs.map((a) => a.toBase58()));
+
+  // BOTH token programs, and both variants of every address that depends on
+  // which one owns the mint. The mint does not exist when the table is built, so
+  // guessing would put the wrong token accounts in it.
+  assert.ok(set.has(TOKEN_PROGRAM.toBase58()));
+  assert.ok(set.has(TOKEN_2022_PROGRAM.toBase58()));
+  for (const w of ws) {
+    const owner = new PublicKey(w.address);
+    assert.ok(set.has(deriveAta(owner, mint, TOKEN_PROGRAM).toBase58()), 'classic ATA missing');
+    assert.ok(set.has(deriveAta(owner, mint, TOKEN_2022_PROGRAM).toBase58()), 'token-2022 ATA missing');
+  }
+  ok('both token programs and both ATA variants are covered, because the mint does not exist yet');
+}
+{
+  const ws = Array.from({ length: 5 }, mkWallet);
+  const mint = Keypair.generate().publicKey;
+  const fee = [Keypair.generate().publicKey];
+  const set = new Set(lookupAddressesFor({ mint, wallets: ws, feeRecipients: fee, buybackRecipients: fee })
+    .map((a) => a.toBase58()));
+  // The creator vault is a PDA of the token's CREATOR, which is unknowable until
+  // the bonding curve exists — so it cannot be pre-tabled and stays a static key.
+  const someCreator = Keypair.generate().publicKey;
+  assert.ok(!set.has(deriveCreatorVaultForTest(someCreator).toBase58()));
+  ok('the creator vault is absent, because the creator is not knowable in advance');
+}
+{
+  const s = offlineSniper();
+  // Without the table the message is 1432 bytes at four buys and will not
+  // compile at five. Refusing to build says so instead of throwing from web3.js.
+  assert.throws(
+    () => s.buildTransaction({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM }),
+    /no address lookup table/,
+  );
+  ok('building without a lookup table is refused with the reason, not a library error');
 }
 
 console.log('\ntelegram control');

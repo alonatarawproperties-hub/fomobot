@@ -15,7 +15,6 @@
 import fs from 'node:fs';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { loadSniperWallets, auditSplit, solStringToLamports } from './src/pump/wallets.mjs';
-import { JitoClient } from './src/pump/jito.mjs';
 import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS } from './src/pump/sniper.mjs';
 import { decideSnipeCommand, resolveTelegram } from './src/pump/snipe-control.mjs';
 import { startControl } from './src/control-io.mjs';
@@ -51,15 +50,18 @@ async function main() {
   const { sniper: cfg, telegram } = loadConfig();
 
   const totalLamports = solStringToLamports(cfg.totalSol, 'config: pumpSniper.totalSol');
-  const tipLamports = solStringToLamports(cfg.jitoTipSol, 'config: pumpSniper.jitoTipSol');
   const slippageBps = BigInt(cfg.slippageBps ?? 500);
   let maxPreBuySol = cfg.maxPreBuySol ?? '0.000000001';
   const maxPreBuyLamports = solStringToLamports(maxPreBuySol, 'config: pumpSniper.maxPreBuySol');
 
   const wallets = loadSniperWallets(cfg.wallets, process.env);
+  // No tip any more: outside a Jito bundle a tip is a donation, not a bid. What
+  // the fee payer does carry is every signature and the whole priority fee.
   const split = auditSplit({
-    wallets, totalLamports, tipLamports,
+    wallets, totalLamports,
     ataRentLamports: ATA_RENT_LAMPORTS, signatureFeeLamports: SIGNATURE_FEE_LAMPORTS,
+    priorityFeeLamports: (BigInt(Math.min(120_000 * wallets.length, 1_400_000))
+      * BigInt(cfg.computeUnitPriceMicroLamports ?? 500_000)) / 1_000_000n,
   });
 
   console.log(`\n  mode          ${START_LIVE ? 'LIVE — this will spend real SOL' : 'PAPER — nothing signed or sent'}`);
@@ -84,13 +86,11 @@ async function main() {
   }
 
   const connection = new Connection(cfg.rpcUrl, { commitment: 'processed', wsEndpoint: cfg.wsUrl });
-  const jito = new JitoClient({ authUuid: process.env.JITO_AUTH_UUID ?? '', relays: cfg.jitoRelays ?? undefined });
 
   const sniper = new PumpSniper({
-    connection, jito, wallets,
+    connection, wallets,
     mints: cfg.mints ?? [],
-    slippageBps, tipLamports,
-    tipWalletIndex: cfg.tipWalletIndex ?? wallets.length - 1,
+    slippageBps,
     computeUnitLimit: cfg.computeUnitLimit ?? 250_000,
     computeUnitPriceMicroLamports: cfg.computeUnitPriceMicroLamports ?? 500_000,
     maxPreBuyLamports,
@@ -110,30 +110,35 @@ async function main() {
   sniper.on('skipped', (d) => { log('warn', 'skipped', d); notify(`⚠️ Skipped <code>${d.mint}</code> — ${d.reason}`); });
   sniper.on('firing', (d) => { log('signal', `LAUNCH ${d.mint}`, { slot: d.slot }); notify(`\u{1F680} <b>LAUNCH DETECTED</b>\n<code>${d.mint}</code>\nslot ${d.slot}`); });
   sniper.on('paper', (d) => {
-    lastResult = `paper bundle built in ${d.elapsedMs}ms`;
-    log('info', 'paper bundle built, not sent', d);
-    notify(`\u{1F4C4} <b>Paper</b> — built ${d.transactions} transactions in ${d.elapsedMs}ms. Nothing sent.`);
+    lastResult = `paper build in ${d.elapsedMs}ms`;
+    log('info', 'paper transaction built, not sent', d);
+    notify(`\u{1F4C4} <b>Paper</b> — built ${d.bytes} bytes, ${d.signers} signers, ${d.elapsedMs}ms. Nothing sent.`);
   });
-  // Accepted by relays is NOT landed. This is the event that says which.
+  // Sent is NOT landed. This is the event that says which.
   sniper.on('settled', (d) => {
-    const line = d.verdict === 'landed'
-      ? `\u2705 <b>LANDED</b> in slot ${d.landedSlot}`
-      : d.verdict === 'dropped-before-auction'
-        ? '\u{1F534} <b>DROPPED BEFORE THE AUCTION</b>\nIt never reached Pending — the block engine '
-          + 'discarded it rather than losing a race. Submission path, not competition.'
-        : '\u{1F7E0} <b>FORWARDED THEN LOST</b>\nIt reached Pending and did not land — it was in the '
-          + 'auction and lost, or reverted. Raise the tip or fix the revert.';
-    log(d.verdict === 'landed' ? 'signal' : 'error', `bundle ${d.verdict}`, {
-      bundleId: d.bundleId, everPending: d.everPending, samples: d.samples?.length,
-      raw: d.samples?.map((x) => x.raw ?? x.error).join(' -> '),
-    });
-    notify(`${line}\n\n<code>${d.bundleId}</code>\nstatus trail: ${d.samples?.map((x) => x.raw ?? 'err').join(' \u2192 ') || '(none)'}`);
+    if (d.landed === true) {
+      log('signal', 'LANDED', { signature: d.signature });
+      notify(`\u2705 <b>LANDED</b>\n<code>${d.signature}</code>\n\nhttps://solscan.io/tx/${d.signature}`);
+    } else if (d.landed === false) {
+      log('error', 'reverted on chain', { signature: d.signature, error: d.error });
+      notify(`\u{1F534} <b>REVERTED</b>\n<code>${d.signature}</code>\n${d.error}`);
+    } else {
+      // Unconfirmed is a failure to OBSERVE, not a failure to land. Saying
+      // otherwise invites resending something that already executed.
+      log('warn', 'unconfirmed', { signature: d.signature, error: d.error });
+      notify(`\u{1F7E0} <b>UNCONFIRMED</b>\n<code>${d.signature}</code>\nIt may still have landed — check the explorer before resending.`);
+    }
+  });
+
+  sniper.on('lookupTable', (d) => {
+    log('info', `lookup table ${d.stage}`, d);
+    if (d.stage === 'ready') notify(`\u{1F5C2} Lookup table ready — ${d.addresses} addresses\n<code>${d.address}</code>`);
   });
 
   sniper.on('sent', (d) => {
-    lastResult = `bundle ${d.bundleId?.slice(0, 12)} sent in ${d.elapsedMs}ms`;
-    log('signal', 'BUNDLE SENT', d);
-    notify(`\u{1F4B8} <b>BUNDLE SENT</b>\n<code>${d.bundleId}</code>\n${d.acceptedBy?.length ?? 0} relay(s), ${d.elapsedMs}ms`);
+    lastResult = `sent ${d.signature?.slice(0, 12)} in ${d.elapsedMs}ms`;
+    log('signal', 'SENT', d);
+    notify(`\u{1F4B8} <b>SENT</b>\n<code>${d.signature}</code>\n${d.bytes} bytes, ${d.signers} signers, ${d.elapsedMs}ms`);
   });
   sniper.on('warn', (d) => log('warn', 'warning', d));
   // A stale blockhash is not a warning, it is a bot that cannot land anything.
@@ -209,20 +214,37 @@ async function main() {
       startedAt,
       onAction: async (action, payload) => {
         switch (action) {
-          case 'set-target':
+          case 'set-target': {
             await sniper.setTarget(payload);
+            // The lookup table is built HERE, not at arm and certainly not at
+            // fire: its entries are only usable in a slot later than the one
+            // that added them, so it cannot be created in the hot path. This
+            // takes a few seconds and a little rent.
+            await control.send('\u{1F5C2} Building the address lookup table — a few seconds. Five buys do not fit in one transaction without it.');
+            try {
+              await sniper.prepareLookupTable({ log: (m) => log('info', `lookup table: ${m}`) });
+            } catch (err) {
+              await control.send(`\u{1F534} <b>Lookup table failed</b>\n${err.message}\n\nCannot arm without it.`);
+            }
             break;
+          }
           case 'arm': {
+            // Without a lookup table the transaction will not compile at all,
+            // so refuse now rather than at the launch.
+            if (!sniper.lookupTable) {
+              await control.send('\u26A0\uFE0F No lookup table. Re-send /target to build one — five buys cannot be compiled into one transaction without it.');
+              return;
+            }
             // Re-read balances at arm time, not just at boot: a wallet drained
-            // since startup would fail its leg, and one failed leg voids the
-            // bundle for all five.
+            // since startup fails its buy, and one failing instruction reverts
+            // the whole transaction.
             await refreshBalances();
             const short = balances.filter((b) => !b.sufficient);
             if (short.length && sniper.mode === 'live') {
               await control.send(
-                `⚠️ <b>Refusing to arm.</b> ${short.length} wallet(s) cannot cover their leg:\n\n`
+                `\u26A0\uFE0F <b>Refusing to arm.</b> ${short.length} wallet(s) cannot cover their buy:\n\n`
                 + short.map((b) => `<code>${b.address}</code>\n  short ${SOL(b.shortfall)}`).join('\n')
-                + '\n\nOne short leg voids the whole bundle.',
+                + '\n\nAll five buys are in ONE transaction, so one short wallet reverts every fill.',
               );
               return;
             }
@@ -231,6 +253,7 @@ async function main() {
               `\u{1F3AF} <b>ARMED</b> · ${sniper.mode === 'live' ? '\u{1F4B8} LIVE' : '\u{1F4C4} PAPER'}\n`
               + `<code>${sniper.target}</code>\n\n`
               + (short.length ? `⚠️ ${short.length} wallet(s) underfunded (paper, so allowed)\n\n` : '')
+              + `lookup table <code>${sniper.lookupTableAddress?.toBase58?.() ?? '-'}</code>\n\n`
               + `Watching the bonding curve. /disarm or /abort to stop.`,
             );
             break;
