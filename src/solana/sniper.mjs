@@ -30,6 +30,7 @@ import {
   BUYBACK_DISCRIMINATOR, BUYBACK_ACCOUNT_SIZE,
   decodeGlobal, decodeBondingCurve, deriveBondingCurve,
   buildBuyInstruction, createAtaIdempotentInstruction, planLadder,
+  tokenProgramForMintAccount,
 } from './pump.mjs';
 import { MAX_BUNDLE_SIZE } from './jito.mjs';
 import bs58 from 'bs58';
@@ -96,7 +97,12 @@ export class PumpSniper extends EventEmitter {
     this.blockhash = null;
     this.blockhashAt = 0;
     this.blockhashTimer = null;
-    this.subscriptions = new Map(); // mint base58 -> subscription id
+    this.subscriptions = new Map(); // mint base58 -> subscription id (bonding curve)
+    this.mintSubscriptions = new Map(); // mint base58 -> subscription id (mint account)
+    /** mint base58 -> token program. Learned from the mint account, never guessed:
+     *  most pump.fun mints are Token-2022, and assuming the classic program
+     *  derives the wrong ATA and fails the buy. */
+    this.tokenPrograms = new Map();
     /** Mints already acted on. A curve account is written on every trade, not
      *  only at creation, so without this the second buy by anyone else would
      *  re-fire the bundle. */
@@ -238,8 +244,9 @@ export class PumpSniper extends EventEmitter {
    * is to exercise every step that can throw without producing anything
    * sendable.
    */
-  buildBundle({ mint, curve, planned }) {
+  buildBundle({ mint, curve, planned, tokenProgram }) {
     if (!this.blockhash) throw new Error('sniper: no blockhash in hand');
+    if (!tokenProgram) throw new Error('sniper: token program for the mint is unknown');
     const feeRecipient = this.#pick(this.global.feeRecipients);
     const buybackRecipient = this.#pick(this.buybackRecipients);
 
@@ -252,7 +259,7 @@ export class PumpSniper extends EventEmitter {
       const instructions = [
         ComputeBudgetProgram.setComputeUnitLimit({ units: this.computeUnitLimit }),
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.computeUnitPriceMicroLamports }),
-        createAtaIdempotentInstruction({ payer: buyer, owner: buyer, mint }),
+        createAtaIdempotentInstruction({ payer: buyer, owner: buyer, mint, tokenProgram }),
         buildBuyInstruction({
           mint,
           buyer,
@@ -261,6 +268,7 @@ export class PumpSniper extends EventEmitter {
           maxSolCost: leg.maxSolCost,
           feeRecipient,
           buybackRecipient,
+          tokenProgram,
         }),
       ];
 
@@ -354,6 +362,32 @@ export class PumpSniper extends EventEmitter {
         { commitment: 'processed' },
       );
       this.subscriptions.set(key, subId);
+
+      // Also watch the MINT account, purely to learn which token program owns
+      // it. At a launch the mint and the curve are created in the same
+      // transaction, so this usually arrives in the same slot as the trigger and
+      // the answer is already cached when the bundle is built. When it is not,
+      // #resolveTokenProgram falls back to one fetch — correct either way, since
+      // the wrong token program fails the buy outright.
+      const mintSubId = this.connection.onAccountChange(
+        mint,
+        (accountInfo) => {
+          try {
+            this.tokenPrograms.set(key, tokenProgramForMintAccount(accountInfo));
+          } catch (err) {
+            this.emit('warn', { at: 'mintAccount', mint: key, error: err?.message ?? String(err) });
+          }
+        },
+        { commitment: 'processed' },
+      );
+      this.mintSubscriptions.set(key, mintSubId);
+
+      // If the mint already exists — testing against a live token rather than
+      // waiting for a launch — resolve it now so the hot path never has to.
+      this.connection.getAccountInfo(mint, 'processed')
+        .then((info) => { if (info) this.tokenPrograms.set(key, tokenProgramForMintAccount(info)); })
+        .catch(() => { /* not created yet; the subscription or the fallback covers it */ });
+
       this.emit('watching', { mint: key, bondingCurve: curveAddress.toBase58() });
     }
   }
@@ -364,6 +398,27 @@ export class PumpSniper extends EventEmitter {
       try { await this.connection.removeAccountChangeListener(subId); } catch { /* already gone */ }
       this.subscriptions.delete(key);
     }
+    for (const [key, subId] of this.mintSubscriptions) {
+      try { await this.connection.removeAccountChangeListener(subId); } catch { /* already gone */ }
+      this.mintSubscriptions.delete(key);
+    }
+  }
+
+  /**
+   * The token program that owns a mint, cached.
+   *
+   * Prefers what the mint subscription already told us so the fire path costs
+   * nothing. Falls back to a single read, which is worth the round trip: guessing
+   * wrong does not degrade the buy, it fails it.
+   */
+  async #resolveTokenProgram(mint) {
+    const key = mint.toBase58();
+    const cached = this.tokenPrograms.get(key);
+    if (cached) return { tokenProgram: cached, cached: true };
+    const info = await this.connection.getAccountInfo(mint, 'processed');
+    const tokenProgram = tokenProgramForMintAccount(info);
+    this.tokenPrograms.set(key, tokenProgram);
+    return { tokenProgram, cached: false };
   }
 
   /** A write landed on a curve we are watching. Decide, plan, fire. */
@@ -411,13 +466,16 @@ export class PumpSniper extends EventEmitter {
       })),
     });
 
-    const bundle = this.buildBundle({ mint, curve, planned });
+    const { tokenProgram, cached } = await this.#resolveTokenProgram(mint);
+    const bundle = this.buildBundle({ mint, curve, planned, tokenProgram });
 
     if (this.paper) {
       this.emit('paper', {
         mint: key, slot: context?.slot ?? null,
         transactions: bundle.built.length,
         sizes: bundle.built.map((b) => b.size),
+        tokenProgram: tokenProgram.toBase58(),
+        tokenProgramCached: cached,
         elapsedMs: Date.now() - seenAt,
       });
       return;

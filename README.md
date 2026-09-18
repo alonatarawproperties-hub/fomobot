@@ -422,7 +422,7 @@ Needs Node 22+ (for the built-in WebSocket).
 ```sh
 npm install
 cp config.example.json config.json   # fill in Helius, Telegram, and the executor block
-npm test                             # 247 offline assertions, no network
+npm test                             # 251 offline assertions, no network
 npm run paper                        # detect + decide + simulate, sign nothing
 npm start
 ```
@@ -537,6 +537,28 @@ more SOL, and the cap absorbs it up to the shave. Past that the bundle reverts
 and nothing is spent — a miss, not a loss. **No wallet can spend more than its
 configured budget, whatever the RPC says**, which is what bounds the damage if
 the curve data we are handed is wrong or hostile.
+
+### Most pump.fun mints are Token-2022, and assuming otherwise fails the buy
+
+Sampling 18 mints the pump program had just touched, on 2026-09-18:
+
+```
+  Token-2022        16
+  classic Token      2
+```
+
+The two programs derive **different** associated token addresses for the same
+owner and mint. So a sniper that assumes the classic program — which is the
+common shape, and what this code did in its first version — builds a buy against
+a token account that does not exist and passes the wrong program account. The
+transaction fails outright: the tip is spent and the bundle lands nothing.
+
+The token program is therefore read from the mint account's owner, never
+guessed, and a mint owned by neither is refused rather than defaulted. To keep
+that off the fire path, the mint account is subscribed alongside the bonding
+curve — at a launch both are created in the same transaction, so the answer is
+normally cached before the trigger arrives. When it is not, one read resolves it,
+which is worth the round trip because the alternative is a guaranteed failure.
 
 ### Five buys in one bundle move the curve against each other
 

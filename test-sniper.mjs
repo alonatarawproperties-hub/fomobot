@@ -19,7 +19,7 @@ import {
   createAtaIdempotentInstruction, buildBuyInstruction,
   tokensForSolIn, solIntoCurveForBudget, planLadder, applyBuy,
   GLOBAL_OFFSET, BUY_DISCRIMINATOR, PUMP_PROGRAM, TOKEN_PROGRAM,
-  ASSOCIATED_TOKEN_PROGRAM,
+  ASSOCIATED_TOKEN_PROGRAM, TOKEN_2022_PROGRAM, tokenProgramForMintAccount,
 } from './src/solana/pump.mjs';
 import {
   loadSniperWallets, keypairFromBase58, solStringToLamports, auditSplit,
@@ -588,7 +588,7 @@ const CURVE = {
 
 {
   const s = offlineSniper();
-  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE) });
+  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
   assert.equal(b.transactions.length, 5);
   // Solana refuses any transaction over 1232 bytes outright. Adding an
   // instruction to the hot path is exactly how that limit gets crossed.
@@ -599,7 +599,7 @@ const CURVE = {
 }
 {
   const s = offlineSniper();
-  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE) });
+  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
   // Bundle order IS execution order, and execution order is what the ladder was
   // priced against. If these ever disagree the later legs are mispriced.
   b.transactions.forEach((b64, i) => {
@@ -611,7 +611,7 @@ const CURVE = {
 }
 {
   const s = offlineSniper();
-  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE) });
+  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
   const counts = b.transactions.map((b64) =>
     VersionedTransaction.deserialize(Buffer.from(b64, 'base64')).message.compiledInstructions.length);
   // Four instructions each (2 compute budget, ATA, buy); the tip wallet has five.
@@ -621,7 +621,7 @@ const CURVE = {
 }
 {
   const s = offlineSniper({ paper: true });
-  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE) });
+  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
   // Paper must produce nothing sendable at all, not an unsigned transaction that
   // some later code path could still hand to a relay.
   assert.equal(b.transactions.length, 0);
@@ -633,8 +633,51 @@ const CURVE = {
 {
   const s = offlineSniper();
   s.blockhash = null;
-  assert.throws(() => s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE) }), /no blockhash/);
+  assert.throws(() => s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM }), /no blockhash/);
   ok('building without a blockhash in hand throws instead of signing something unlandable');
+}
+
+{
+  const s = offlineSniper();
+  assert.throws(
+    () => s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE) }),
+    /token program for the mint is unknown/,
+  );
+  ok('building without a resolved token program throws rather than guessing the classic one');
+}
+{
+  // Sampled on mainnet 2026-09-18: 16 of 18 pump-touched mints were Token-2022.
+  // Assuming the classic program derives a DIFFERENT associated token address,
+  // so the buy fails outright — the tip is spent and the bundle lands nothing.
+  const mint = Keypair.generate().publicKey;
+  const owner = Keypair.generate().publicKey;
+  const classic = deriveAta(owner, mint, TOKEN_PROGRAM);
+  const t22 = deriveAta(owner, mint, TOKEN_2022_PROGRAM);
+  assert.notEqual(classic.toBase58(), t22.toBase58());
+  ok('the two token programs derive different token accounts, which is why it cannot be assumed');
+}
+{
+  assert.equal(tokenProgramForMintAccount({ owner: TOKEN_PROGRAM }).toBase58(), TOKEN_PROGRAM.toBase58());
+  assert.equal(tokenProgramForMintAccount({ owner: TOKEN_2022_PROGRAM }).toBase58(), TOKEN_2022_PROGRAM.toBase58());
+  assert.throws(() => tokenProgramForMintAccount(null), /not readable/);
+  // Anything else is refused, not defaulted — a mint owned by something we do
+  // not recognise is not a mint we should be buying.
+  assert.throws(() => tokenProgramForMintAccount({ owner: PUMP_PROGRAM }), /not a token program/);
+  ok('a mint owned by neither token program is refused rather than defaulted');
+}
+{
+  const s = offlineSniper();
+  const mint = s.mints[0];
+  const planned = s.plan(CURVE);
+  const a = s.buildBundle({ mint, curve: CURVE, planned, tokenProgram: TOKEN_PROGRAM });
+  const b = s.buildBundle({ mint, curve: CURVE, planned, tokenProgram: TOKEN_2022_PROGRAM });
+  const keysOf = (b64) => VersionedTransaction.deserialize(Buffer.from(b64, 'base64'))
+    .message.staticAccountKeys.map((k) => k.toBase58());
+  // The chosen program must actually reach the transaction, not just be accepted.
+  assert.ok(keysOf(a.transactions[0]).includes(TOKEN_PROGRAM.toBase58()));
+  assert.ok(keysOf(b.transactions[0]).includes(TOKEN_2022_PROGRAM.toBase58()));
+  assert.notDeepEqual(keysOf(a.transactions[0]), keysOf(b.transactions[0]));
+  ok('the resolved token program reaches the built transaction and changes its accounts');
 }
 
 console.log('\ntelegram control');

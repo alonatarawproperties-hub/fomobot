@@ -330,3 +330,23 @@ export function buildBuyInstruction({
     data,
   });
 }
+
+/**
+ * Which token program owns a mint.
+ *
+ * NOT a detail, and NOT safely assumable. Sampling 18 mints the pump program had
+ * just touched on 2026-09-18 found SIXTEEN owned by Token-2022 and two by the
+ * classic Token program. Guessing the classic one — which is what most pump.fun
+ * sniper code does, and what this file did in its first version — derives the
+ * wrong associated token address and passes the wrong program account, so the
+ * buy fails outright. The tip is spent, the bundle lands nothing.
+ *
+ * Anything that is neither token program is refused rather than guessed at.
+ */
+export function tokenProgramForMintAccount(accountInfo) {
+  const owner = accountInfo?.owner;
+  if (!owner) throw new Error('mint account not readable');
+  if (owner.equals(TOKEN_PROGRAM)) return TOKEN_PROGRAM;
+  if (owner.equals(TOKEN_2022_PROGRAM)) return TOKEN_2022_PROGRAM;
+  throw new Error(`mint is owned by ${owner.toBase58()}, which is not a token program`);
+}
