@@ -66,8 +66,8 @@ async function main() {
 
   console.log(`\n  mode          ${START_LIVE ? 'LIVE — this will spend real SOL' : 'PAPER — nothing signed or sent'}`);
   if (REHEARSE) {
-    console.log('  REHEARSAL     buying 1 raw token unit per wallet, 0.001 SOL tip');
-    console.log('                structurally identical bundle, ~0.0017 SOL unrecoverable');
+    console.log('  REHEARSAL     buying 1 raw token unit per wallet, no tip (there is none any more)');
+    console.log('                structurally identical transaction, ~0.011 SOL of it recoverable token-account rent');
   }
   console.log(`  wallets       ${wallets.length}`);
   console.log(`  target        ${(cfg.mints ?? [])[0] ?? '(none — set it with /target over Telegram)'}`);
