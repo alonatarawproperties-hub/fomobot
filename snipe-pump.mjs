@@ -147,7 +147,8 @@ async function main() {
   sniper.on('sent', (d) => {
     lastResult = `sent ${d.signature?.slice(0, 12)} in ${d.elapsedMs}ms`;
     log('signal', 'BUNDLE SENT', d);
-    notify(`\u{1F4B8} <b>BUNDLE SENT</b>\n<code>${d.signature}</code>\n${d.elapsedMs}ms via Helius Sender`);
+    notify(`\u{1F4B8} <b>BUNDLE SENT</b>\n<code>${d.signature}</code>\n${d.elapsedMs}ms via Helius Sender`
+      + (d.bundleId ? `\nbundle <code>${d.bundleId.slice(0, 16)}…</code>` : ''));
   });
   sniper.on('warn', (d) => log('warn', 'warning', d));
   // A stale blockhash is not a warning, it is a bot that cannot land anything.

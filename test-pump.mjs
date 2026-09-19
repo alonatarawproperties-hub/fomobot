@@ -425,7 +425,11 @@ console.log('\nhelius sender');
     },
   });
   const r = await sender.sendBundle(['tx1', 'tx2', 'tx3', 'tx4', 'tx5']);
-  assert.equal(r.signature, 'SIG123');
+  // Sender answers with a 64-hex BUNDLE ID, not a base58 signature. Measured:
+  // a real submission returns {"result":"9b5ad868...c704"}. Passing that to
+  // confirmTransaction fails with "signature must be base58 encoded".
+  assert.equal(r.bundleId, 'SIG123');
+  assert.equal(r.signature, undefined);
   // Same wire format Jito takes: [[transactions], {encoding}].
   assert.equal(calls[0].body.method, 'sendBundle');
   assert.deepEqual(calls[0].body.params[0], ['tx1', 'tx2', 'tx3', 'tx4', 'tx5']);
@@ -840,6 +844,23 @@ const CURVE = {
   assert.notEqual(data.readBigUInt64LE(8), 1n);
   assert.equal(data.readBigUInt64LE(16), 2_600_000_000n);
   ok('the real path still asks for the planned size — rehearsal plumbing does not leak into it');
+}
+
+{
+  const s = offlineSniper();
+  const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
+  // We sign these, so we know their signatures. Asking the submission endpoint
+  // for one is what produced "signature must be base58 encoded: undefined" on a
+  // live run — Sender returns a bundle id, and a bundle id is not a signature.
+  assert.equal(b.signatures.length, 5);
+  for (let i = 0; i < 5; i++) {
+    const tx = VersionedTransaction.deserialize(Buffer.from(b.transactions[i], 'base64'));
+    assert.equal(b.signatures[i], bs58.encode(tx.signatures[0]));
+    // And it must be base58, because confirmTransaction parses it as such.
+    assert.match(b.signatures[i], /^[1-9A-HJ-NP-Za-km-z]{86,90}$/);
+  }
+  assert.equal(new Set(b.signatures).size, 5, 'each wallet signs its own transaction');
+  ok('the bundle hands back the base58 signatures it produced, one per wallet');
 }
 
 console.log('\ntelegram control');

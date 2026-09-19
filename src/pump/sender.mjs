@@ -94,10 +94,11 @@ export class HeliusSender {
   /**
    * Submit an atomic bundle. Same wire format as Jito's sendBundle.
    *
-   * Returns the signature of the FIRST transaction, which is what Sender
-   * answers with — not a Jito-style bundle id. That is an improvement: a
-   * signature can be looked up on chain, whereas a bundle id could only be
-   * asked about through an API that answered "Invalid" for everything.
+   * Returns the BUNDLE ID Sender answers with — a 64-character hex string, not
+   * a base58 signature. Measured, not assumed: posting a well-formed bundle
+   * returns {"result":"9b5ad868...c704"}. Passing that to confirmTransaction
+   * fails with "signature must be base58 encoded", so the caller confirms using
+   * the signatures it produced when it signed, which it already has.
    */
   async sendBundle(base64Transactions) {
     if (!Array.isArray(base64Transactions) || base64Transactions.length === 0) {
@@ -109,11 +110,13 @@ export class HeliusSender {
       );
     }
     const result = await this.#rpc('sendBundle', [base64Transactions, { encoding: 'base64' }]);
-    return { signature: Array.isArray(result) ? result[0] : result, raw: result };
+    return { bundleId: typeof result === 'string' ? result : JSON.stringify(result), raw: result };
   }
 
   /** Submit a single transaction down the same fast paths. */
   async sendTransaction(base64Transaction) {
+    // skipPreflight must be true: Sender answers a preflight request with
+    // "running preflight check is not supported" and an HTTP 500.
     const signature = await this.#rpc('sendTransaction', [
       base64Transaction,
       { encoding: 'base64', skipPreflight: true, maxRetries: 0 },

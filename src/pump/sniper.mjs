@@ -339,6 +339,7 @@ export class PumpSniper extends EventEmitter {
     const buybackRecipient = this.#pick(this.buybackRecipients);
 
     const transactions = [];
+    const signatures = [];
     const built = [];
     for (const leg of planned.legs) {
       const wallet = this.wallets[leg.index];
@@ -390,9 +391,15 @@ export class PumpSniper extends EventEmitter {
       tx.sign([wallet.keypair]);
       const serialized = Buffer.from(tx.serialize()).toString('base64');
       transactions.push(serialized);
+      // Keep the signature. We produced it, so there is no reason to ask a
+      // submission API for it — and Sender does not return one: its sendBundle
+      // answers with a 64-hex BUNDLE ID, which confirmTransaction rejects
+      // outright because it is not base58. Computing it here is both correct
+      // and the only way to confirm the bundle against the chain.
+      signatures.push(bs58.encode(tx.signatures[0]));
       built.push({ leg, size: serialized.length, signed: true });
     }
-    return { transactions, built, feeRecipient, buybackRecipient, paper: this.paper };
+    return { transactions, signatures, built, feeRecipient, buybackRecipient, paper: this.paper };
   }
 
   /**
@@ -580,9 +587,14 @@ export class PumpSniper extends EventEmitter {
     }
 
     const result = await this.sender.sendBundle(bundle.transactions);
+    // The bundle is atomic, so confirming ANY of its transactions confirms all
+    // of them. The first is as good as any and is the one we can name.
+    const signature = bundle.signatures[0];
     this.emit('sent', {
       mint: key, slot: context?.slot ?? null,
-      signature: result.signature,
+      signature,
+      bundleId: result.bundleId ?? null,
+      signatures: bundle.signatures,
       blockhashAgeMs: Date.now() - this.blockhashAt,
       elapsedMs: Date.now() - seenAt,
       rehearsal: this.rehearse,
@@ -595,15 +607,15 @@ export class PumpSniper extends EventEmitter {
     // for everything.
     const { blockhash, lastValidBlockHeight } = this.blockhash;
     this.connection.confirmTransaction(
-      { signature: result.signature, blockhash, lastValidBlockHeight }, 'confirmed',
+      { signature, blockhash, lastValidBlockHeight }, 'confirmed',
     ).then((res) => this.emit('settled', {
-      mint: key, signature: result.signature,
+      mint: key, signature,
       landed: !res.value.err,
       error: res.value.err ? JSON.stringify(res.value.err) : null,
     })).catch((err) => this.emit('settled', {
       // Unconfirmed is a failure to OBSERVE, not a failure to land. Reporting it
       // as failure invites resending something that already executed.
-      mint: key, signature: result.signature, landed: null,
+      mint: key, signature, landed: null,
       error: `unconfirmed: ${err?.message ?? err}`,
     }));
 
