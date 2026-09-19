@@ -74,6 +74,57 @@ export const REHEARSAL_TIP_LAMPORTS = 1_000_000n;   // 0.001 SOL
  */
 export const MAX_BLOCKHASH_AGE_MS = 30_000;
 
+/** Solana refuses any transaction over this, outright. */
+export const MAX_TRANSACTION_BYTES = 1232;
+
+/**
+ * How many buys fit in ONE transaction.
+ *
+ * Byte-limited, not CPI-limited. Measured: one buy with its token-account create
+ * is 787 bytes, two are 1002, three are 1217, and four are 1432 — past the
+ * 1232-byte ceiling. Three is the most that fits.
+ */
+export const MAX_BUYS_PER_TRANSACTION = 3;
+
+/**
+ * Compute units requested per buy.
+ *
+ * Measured on mainnet: a buy plus its token-account create burns 88,000-99,000.
+ * 130,000 leaves headroom without over-requesting, which is not free — the
+ * priority fee is charged on the limit asked for, not the units burned.
+ */
+export const COMPUTE_UNITS_PER_BUY = 130_000;
+
+/**
+ * Spread the buys across as few transactions as the limits allow.
+ *
+ * Two ceilings meet here and neither is negotiable. Helius Sender refuses a
+ * bundle of more than FOUR transactions — measured, it answers "bundle must
+ * contain no more than 4 transactions" with HTTP 500 — and one transaction holds
+ * at most three buys before it passes 1232 bytes. Five wallets therefore cannot
+ * have one transaction each, which is what this assumed and what failed twice
+ * while reporting success, because the refusal arrived in an error shape the
+ * client was not reading.
+ *
+ * Order is preserved exactly: transactions execute in bundle order, buys execute
+ * in order inside each one. So the ladder is priced as before — every leg
+ * against the curve the leg before it leaves behind.
+ */
+export function packLegs(legs, { maxTransactions = MAX_BUNDLE_SIZE, maxPerTransaction = MAX_BUYS_PER_TRANSACTION } = {}) {
+  if (!Array.isArray(legs) || legs.length === 0) throw new Error('packLegs: no legs');
+  const perTransaction = Math.ceil(legs.length / maxTransactions);
+  if (perTransaction > maxPerTransaction) {
+    throw new Error(
+      `packLegs: ${legs.length} wallets need ${perTransaction} buys per transaction, but only ` +
+      `${maxPerTransaction} fit in ${MAX_TRANSACTION_BYTES} bytes. The ceiling is ` +
+      `${maxTransactions * maxPerTransaction} wallets.`,
+    );
+  }
+  const groups = [];
+  for (let i = 0; i < legs.length; i += perTransaction) groups.push(legs.slice(i, i + perTransaction));
+  return groups;
+}
+
 export class PumpSniper extends EventEmitter {
   /**
    * @param {object} opts
@@ -101,8 +152,12 @@ export class PumpSniper extends EventEmitter {
     if (!connection) throw new Error('sniper: connection is required');
     if (!sender) throw new Error('sniper: sender client is required');
     if (!Array.isArray(wallets) || wallets.length === 0) throw new Error('sniper: no wallets');
-    if (wallets.length > MAX_BUNDLE_SIZE) {
-      throw new Error(`sniper: ${wallets.length} wallets exceeds the ${MAX_BUNDLE_SIZE}-transaction bundle limit`);
+    const ceiling = MAX_BUNDLE_SIZE * MAX_BUYS_PER_TRANSACTION;
+    if (wallets.length > ceiling) {
+      throw new Error(
+        `sniper: ${wallets.length} wallets exceeds ${ceiling} — Sender takes at most ${MAX_BUNDLE_SIZE} ` +
+        `transactions and at most ${MAX_BUYS_PER_TRANSACTION} buys fit in each`,
+      );
     }
     // Deliberately allowed to be empty. The contract address is usually not
     // known when the process starts — that is the entire reason the Telegram
@@ -324,81 +379,93 @@ export class PumpSniper extends EventEmitter {
    * is to exercise every step that can throw without producing anything
    * sendable.
    */
+  /**
+   * Build the bundle: every wallet's buy, packed into at most four transactions.
+   *
+   * One transaction per wallet is what a Jito bundle allows and what this did
+   * first. Helius Sender takes only four, so five wallets share them — see
+   * packLegs. Execution order is unchanged, which is what keeps the ladder
+   * correct.
+   */
   buildBundle({ mint, curve, planned, tokenProgram }) {
     if (!this.blockhash) throw new Error('sniper: no blockhash in hand');
     const age = Date.now() - this.blockhashAt;
     if (age > MAX_BLOCKHASH_AGE_MS) {
       throw new Error(
         `sniper: the blockhash is ${Math.round(age / 1000)}s old and a transaction is only valid for about 60s. ` +
-        'Signing it would produce a bundle every relay accepts and no leader can execute. ' +
-        'The refresh must be failing — check connectivity to the RPC.',
+        'Signing it would produce something no leader can execute. The refresh must be failing — check the RPC.',
       );
     }
     if (!tokenProgram) throw new Error('sniper: token program for the mint is unknown');
+
     const feeRecipient = this.#pick(this.global.feeRecipients);
     const buybackRecipient = this.#pick(this.buybackRecipients);
+    const groups = packLegs(planned.legs);
 
     const transactions = [];
     const signatures = [];
     const built = [];
-    for (const leg of planned.legs) {
-      const wallet = this.wallets[leg.index];
-      const buyer = wallet.keypair.publicKey;
 
+    groups.forEach((group, groupIndex) => {
+      const signers = group.map((leg) => this.wallets[leg.index].keypair);
       const instructions = [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: this.computeUnitLimit }),
+        ComputeBudgetProgram.setComputeUnitLimit({ units: COMPUTE_UNITS_PER_BUY * group.length }),
         ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.computeUnitPriceMicroLamports }),
-        createAtaIdempotentInstruction({ payer: buyer, owner: buyer, mint, tokenProgram }),
-        buildBuyInstruction({
+      ];
+
+      for (const leg of group) {
+        const buyer = this.wallets[leg.index].keypair.publicKey;
+        instructions.push(createAtaIdempotentInstruction({ payer: buyer, owner: buyer, mint, tokenProgram }));
+        instructions.push(buildBuyInstruction({
           mint,
           buyer,
           creator: curve.creator,
-          // One raw token unit, capped at 0.001 SOL. Everything else about the
-          // transaction is untouched, so what is tested is the submission path.
           amountTokens: this.rehearse ? 1n : leg.requestTokens,
           maxSolCost: this.rehearse ? REHEARSAL_MAX_SOL_COST : leg.maxSolCost,
           feeRecipient,
           buybackRecipient,
           tokenProgram,
-        }),
-      ];
+        }));
+      }
 
-      // The tip rides inside one of the five rather than as a sixth
-      // transaction: the bundle limit is five, and five wallets fills it.
-      if (leg.index === this.tipWalletIndex) {
+      // The tip rides in the LAST transaction. The bundle is atomic, so where it
+      // sits does not change what is paid — only that it is present.
+      if (groupIndex === groups.length - 1) {
         instructions.push(SystemProgram.transfer({
-          fromPubkey: buyer,
+          fromPubkey: signers[signers.length - 1].publicKey,
           toPubkey: new PublicKey(this.#pick(this.tipAccounts)),
-          lamports: Number(this.rehearse ? REHEARSAL_TIP_LAMPORTS : this.tipLamports),
+          lamports: Number(this.tipLamports),
         }));
       }
 
       const message = new TransactionMessage({
-        payerKey: buyer,
+        payerKey: signers[0].publicKey,
         recentBlockhash: this.blockhash.blockhash,
         instructions,
       }).compileToV0Message();
-
       const tx = new VersionedTransaction(message);
-      // Serialising an unsigned v0 transaction still exercises message
-      // compilation, the account table and the size limit — everything that can
-      // reject a bundle before it is sent. Paper mode stops at the signature and
-      // returns no transaction, so there is nothing a later bug could submit.
+
       if (this.paper) {
-        built.push({ leg, size: message.serialize().length, signed: false });
-        continue;
+        built.push({
+          wallets: group.map((l) => l.label),
+          size: message.serialize().length + 1 + 64 * message.header.numRequiredSignatures,
+          signers: message.header.numRequiredSignatures, signed: false,
+        });
+        return;
       }
-      tx.sign([wallet.keypair]);
-      const serialized = Buffer.from(tx.serialize()).toString('base64');
-      transactions.push(serialized);
-      // Keep the signature. We produced it, so there is no reason to ask a
-      // submission API for it — and Sender does not return one: its sendBundle
-      // answers with a 64-hex BUNDLE ID, which confirmTransaction rejects
-      // outright because it is not base58. Computing it here is both correct
-      // and the only way to confirm the bundle against the chain.
+
+      tx.sign(signers);
+      const raw = tx.serialize();
+      if (raw.length > MAX_TRANSACTION_BYTES) {
+        throw new Error(`sniper: transaction ${groupIndex + 1} is ${raw.length} bytes, over the ${MAX_TRANSACTION_BYTES} limit`);
+      }
+      transactions.push(Buffer.from(raw).toString('base64'));
+      // We signed it, so we know its signature. Sender answers with a hex bundle
+      // id, which confirmTransaction rejects as not base58.
       signatures.push(bs58.encode(tx.signatures[0]));
-      built.push({ leg, size: serialized.length, signed: true });
-    }
+      built.push({ wallets: group.map((l) => l.label), size: raw.length, signers: signers.length, signed: true });
+    });
+
     return { transactions, signatures, built, feeRecipient, buybackRecipient, paper: this.paper };
   }
 

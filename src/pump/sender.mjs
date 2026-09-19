@@ -48,8 +48,16 @@ export const SENDER_TIP_ACCOUNTS = [
  */
 export const MIN_TIP_LAMPORTS = 1_000_000n;
 
-/** A bundle is still capped at five transactions. */
-export const MAX_BUNDLE_SIZE = 5;
+/**
+ * Sender's bundle limit is FOUR, not Jito's five.
+ *
+ * Measured, because it is not in the documentation we could find: a five-
+ * transaction bundle is refused with HTTP 500 and
+ * "Invalid Request: bundle must contain no more than 4 transactions", while one,
+ * two and three all return a bundle id. Five wallets therefore have to share
+ * four transactions — see packLegs in sniper.mjs.
+ */
+export const MAX_BUNDLE_SIZE = 4;
 
 export class HeliusSender {
   constructor({ url = SENDER_URL, apiKey = '', timeoutMs = 5000, fetchImpl = fetch, swqosOnly = false } = {}) {
@@ -79,14 +87,25 @@ export class HeliusSender {
     } catch {
       throw new Error(`sender ${method}: HTTP ${res.status} ${text.slice(0, 200)}`);
     }
-    if (body.error) {
-      const msg = body.error.message ?? JSON.stringify(body.error);
+    // Sender reports errors in TWO shapes and this cost two live runs to find:
+    // the JSON-RPC {error:{code,message}}, and a bare {code,message} at the top
+    // level served with HTTP 500. Checking only the first returned body.result —
+    // undefined — as if it were a success, so "bundle must contain no more than
+    // 4 transactions" was swallowed and reported as a sent bundle.
+    const problem = body.error ?? (body.code !== undefined && body.message !== undefined ? body : null);
+    if (problem) {
+      const msg = problem.message ?? JSON.stringify(problem);
       const err = new Error(`sender ${method}: ${msg}`);
       if (res.status === 429 || /rate.?limit/i.test(msg)) err.rateLimited = true;
-      // Sender validates synchronously, so a rejection here NAMES the fault.
-      // That is strictly better than Jito's accept-then-discard.
-      if (res.status === 400 || body.error.code === -32602) err.rejectedAtIngress = true;
+      // Sender validates synchronously, so a rejection NAMES the fault — which
+      // is the whole advantage over Jito's accept-then-discard.
+      if (!res.ok || problem.code === -32602) err.rejectedAtIngress = true;
       throw err;
+    }
+    // A 200 with no result is not a success either. Returning undefined here is
+    // what let a refused bundle look like a sent one.
+    if (body.result === undefined) {
+      throw new Error(`sender ${method}: HTTP ${res.status} returned no result — ${text.slice(0, 200)}`);
     }
     return body.result;
   }

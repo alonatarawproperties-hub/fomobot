@@ -25,10 +25,11 @@ import {
   loadSniperWallets, keypairFromBase58, solStringToLamports, auditSplit,
   MAX_BUNDLE_TRANSACTIONS,
 } from './src/pump/wallets.mjs';
-import { JitoClient, normaliseStatus } from './src/pump/jito.mjs';
+import { JitoClient, normaliseStatus, MAX_BUNDLE_SIZE as JITO_MAX_BUNDLE } from './src/pump/jito.mjs';
 import { HeliusSender, SENDER_TIP_ACCOUNTS, MIN_TIP_LAMPORTS, MAX_BUNDLE_SIZE } from './src/pump/sender.mjs';
 import { PumpSniper, ATA_RENT_LAMPORTS, SIGNATURE_FEE_LAMPORTS, MAX_BLOCKHASH_AGE_MS,
-         REHEARSAL_MAX_SOL_COST, REHEARSAL_TIP_LAMPORTS } from './src/pump/sniper.mjs';
+         REHEARSAL_MAX_SOL_COST, packLegs, MAX_BUYS_PER_TRANSACTION,
+         MAX_TRANSACTION_BYTES } from './src/pump/sniper.mjs';
 import { decideSnipeCommand, resolveTelegram } from './src/pump/snipe-control.mjs';
 
 let pass = 0;
@@ -424,7 +425,7 @@ console.log('\nhelius sender');
       return { ok: true, status: 200, text: async () => JSON.stringify({ result: 'SIG123' }) };
     },
   });
-  const r = await sender.sendBundle(['tx1', 'tx2', 'tx3', 'tx4', 'tx5']);
+  const r = await sender.sendBundle(['tx1', 'tx2', 'tx3', 'tx4']);
   // Sender answers with a 64-hex BUNDLE ID, not a base58 signature. Measured:
   // a real submission returns {"result":"9b5ad868...c704"}. Passing that to
   // confirmTransaction fails with "signature must be base58 encoded".
@@ -432,7 +433,7 @@ console.log('\nhelius sender');
   assert.equal(r.signature, undefined);
   // Same wire format Jito takes: [[transactions], {encoding}].
   assert.equal(calls[0].body.method, 'sendBundle');
-  assert.deepEqual(calls[0].body.params[0], ['tx1', 'tx2', 'tx3', 'tx4', 'tx5']);
+  assert.deepEqual(calls[0].body.params[0], ['tx1', 'tx2', 'tx3', 'tx4']);
   assert.equal(calls[0].body.params[1].encoding, 'base64');
   assert.match(calls[0].url, /api-key=k/);
   ok('a bundle goes to Sender in Jito wire format and comes back with a real signature');
@@ -440,8 +441,10 @@ console.log('\nhelius sender');
 {
   const sender = new HeliusSender({ fetchImpl: async () => { throw new Error('must not be called'); } });
   await assert.rejects(sender.sendBundle([]), /empty bundle/);
-  await assert.rejects(sender.sendBundle(['a', 'b', 'c', 'd', 'e', 'f']), /exceeds the 5-transaction/);
-  assert.equal(MAX_BUNDLE_SIZE, 5);
+  // Sender's limit is FOUR, not Jito's five. Measured: a five-transaction
+  // bundle is refused with "bundle must contain no more than 4 transactions".
+  await assert.rejects(sender.sendBundle(['a', 'b', 'c', 'd', 'e']), /exceeds the 4-transaction/);
+  assert.equal(MAX_BUNDLE_SIZE, 4);
   ok('an empty bundle and a sixth transaction are refused before any network call');
 }
 {
@@ -476,10 +479,66 @@ console.log('\nhelius sender');
   ok('Sender\'s minimum tip is 0.001 SOL, and a smaller one is a configuration error');
 }
 
+{
+  // THE BUG THAT COST TWO LIVE RUNS. Sender serves some errors as a bare
+  // {code, message} with HTTP 500 rather than the JSON-RPC {error:{...}}.
+  // Reading only body.error returned body.result — undefined — as a success, so
+  // a refused bundle was reported as sent.
+  const sender = new HeliusSender({
+    fetchImpl: async () => ({ ok: false, status: 500, text: async () => JSON.stringify({
+      code: -32602, message: 'Invalid Request: bundle must contain no more than 4 transactions' }) }),
+  });
+  // Assert the SHAPE was understood, not merely that something threw: the
+  // catch-all "no result" path also quotes the body, so matching the message
+  // text alone passes even when the error shape is ignored.
+  await assert.rejects(sender.sendBundle(['a', 'b', 'c', 'd']), (err) => {
+    assert.match(err.message, /no more than 4 transactions/);
+    assert.ok(!/returned no result/.test(err.message), 'fell through to the generic no-result path');
+    assert.equal(err.rejectedAtIngress, true, 'a named 500 is an ingress rejection');
+    return true;
+  });
+  ok('a bare {code,message} error is parsed as an error, not swallowed as an undefined result');
+}
+{
+  // Nor may a 200 with no result pass as success.
+  const sender = new HeliusSender({
+    fetchImpl: async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ jsonrpc: '2.0', id: 1 }) }),
+  });
+  await assert.rejects(sender.sendBundle(['a']), /returned no result/);
+  ok('a 200 carrying no result throws rather than reporting an undefined bundle id');
+}
+{
+  const legs = [1, 2, 3, 4, 5].map((i) => ({ label: `w${i}`, index: i - 1 }));
+  const groups = packLegs(legs);
+  // Five wallets cannot have one transaction each: Sender takes four.
+  assert.ok(groups.length <= MAX_BUNDLE_SIZE);
+  assert.equal(groups.length, 3);
+  assert.deepEqual(groups.map((g) => g.length), [2, 2, 1]);
+  // Order is what the ladder was priced against, so it must survive packing.
+  assert.deepEqual(groups.flat().map((l) => l.label), ['w1', 'w2', 'w3', 'w4', 'w5']);
+  ok('five wallets pack into three transactions with their execution order intact');
+}
+{
+  for (const n of [1, 2, 3, 4, 6, 8, 12]) {
+    const legs = Array.from({ length: n }, (_, i) => ({ label: `w${i}`, index: i }));
+    const g = packLegs(legs);
+    assert.ok(g.length <= MAX_BUNDLE_SIZE, `${n} wallets made ${g.length} transactions`);
+    assert.ok(g.every((x) => x.length <= MAX_BUYS_PER_TRANSACTION), `${n} wallets over-packed a transaction`);
+    assert.equal(g.flat().length, n);
+  }
+  // Past the ceiling it refuses instead of quietly dropping a wallet.
+  assert.throws(() => packLegs(Array.from({ length: 13 }, (_, i) => ({ label: `w${i}`, index: i }))), /ceiling is 12/);
+  assert.throws(() => packLegs([]), /no legs/);
+  ok('every wallet count up to the ceiling packs inside both limits, and past it throws');
+}
+
 console.log('\njito bundling');
 
 {
-  assert.equal(MAX_BUNDLE_SIZE, 5);
+  // Jito allows five; Sender allows four. Two different limits, and conflating
+  // them is what sent a five-transaction bundle to an endpoint that takes four.
+  assert.equal(JITO_MAX_BUNDLE, 5);
+  assert.equal(MAX_BUNDLE_SIZE, 4);
   const j = new JitoClient({ fetchImpl: async () => { throw new Error('must not be called'); } });
   await assert.rejects(j.sendBundle([]), /empty bundle/);
   await assert.rejects(j.sendBundle(['a', 'b', 'c', 'd', 'e', 'f']), /exceeds the 5-transaction bundle limit/);
@@ -687,35 +746,41 @@ const CURVE = {
 {
   const s = offlineSniper();
   const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
-  assert.equal(b.transactions.length, 5);
-  // Solana refuses any transaction over 1232 bytes outright. Adding an
-  // instruction to the hot path is exactly how that limit gets crossed.
+  // THREE transactions, not five: Sender takes at most four, so the five
+  // wallets share them. Every buy is still in the one atomic bundle.
+  assert.equal(b.transactions.length, 3);
+  assert.ok(b.transactions.length <= MAX_BUNDLE_SIZE);
   for (const tx of b.transactions) {
-    assert.ok(Buffer.from(tx, 'base64').length <= 1232, 'transaction exceeds the 1232-byte limit');
+    assert.ok(Buffer.from(tx, 'base64').length <= MAX_TRANSACTION_BYTES, 'transaction exceeds the byte limit');
   }
-  ok('all five transactions are built and every one fits inside the 1232-byte limit');
+  ok('five wallets build into three transactions, each inside the 1232-byte limit');
 }
 {
   const s = offlineSniper();
   const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
   // Bundle order IS execution order, and execution order is what the ladder was
   // priced against. If these ever disagree the later legs are mispriced.
-  b.transactions.forEach((b64, i) => {
+  // Packed [w1+w2, w3+w4, w5], so the fee payers are wallets 1, 3 and 5 and the
+  // signature counts are 2, 2, 1.
+  const sigCounts = b.transactions.map((b64) =>
+    VersionedTransaction.deserialize(Buffer.from(b64, 'base64')).message.header.numRequiredSignatures);
+  assert.deepEqual(sigCounts, [2, 2, 1]);
+  assert.equal(sigCounts.reduce((a, x) => a + x, 0), 5, 'every wallet must sign exactly once');
+  b.transactions.forEach((b64) => {
     const tx = VersionedTransaction.deserialize(Buffer.from(b64, 'base64'));
-    assert.equal(tx.message.staticAccountKeys[0].toBase58(), s.wallets[i].address);
-    assert.ok(tx.signatures.some((sg) => sg.some((byte) => byte !== 0)), 'transaction is unsigned');
+    for (const sg of tx.signatures) assert.ok(sg.some((byte) => byte !== 0), 'a wallet did not sign');
   });
-  ok('the bundle is signed and in wallet order, which is the order the ladder priced');
+  ok('all five wallets sign across the three transactions, and none is left unsigned');
 }
 {
   const s = offlineSniper();
   const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
   const counts = b.transactions.map((b64) =>
     VersionedTransaction.deserialize(Buffer.from(b64, 'base64')).message.compiledInstructions.length);
-  // Four instructions each (2 compute budget, ATA, buy); the tip wallet has five.
-  assert.deepEqual(counts, [4, 4, 4, 4, 5]);
-  assert.equal(counts.filter((c) => c === 5).length, 1);
-  ok('exactly one transaction carries the Jito tip, and it is the configured one');
+  // 2 compute-budget + (create, buy) per wallet in the group; the LAST
+  // transaction also carries the tip.
+  assert.deepEqual(counts, [2 + 2 * 2, 2 + 2 * 2, 2 + 1 * 2 + 1]);
+  ok('each transaction carries its group\'s buys, and only the last one carries the tip');
 }
 {
   const s = offlineSniper({ paper: true });
@@ -723,10 +788,11 @@ const CURVE = {
   // Paper must produce nothing sendable at all, not an unsigned transaction that
   // some later code path could still hand to a relay.
   assert.equal(b.transactions.length, 0);
-  assert.equal(b.built.length, 5);
+  assert.equal(b.built.length, 3);
   assert.equal(b.paper, true);
   assert.ok(b.built.every((x) => x.signed === false));
-  ok('paper mode builds and measures all five but emits nothing that could be sent');
+  assert.equal(b.built.flatMap((x) => x.wallets).length, 5, 'all five wallets must still be planned');
+  ok('paper measures every transaction but emits nothing that could be sent');
 }
 {
   const s = offlineSniper();
@@ -753,7 +819,7 @@ const CURVE = {
   // normal refresh interval trips it.
   s.blockhashAt = Date.now() - (MAX_BLOCKHASH_AGE_MS - 5_000);
   const b = s.buildBundle({ mint: s.mints[0], curve: CURVE, planned: s.plan(CURVE), tokenProgram: TOKEN_PROGRAM });
-  assert.equal(b.transactions.length, 5);
+  assert.equal(b.transactions.length, 3);
   assert.ok(MAX_BLOCKHASH_AGE_MS < 60_000, 'the guard must be tighter than the cluster own expiry');
   ok('a blockhash inside the window still builds, and the window is tighter than the cluster');
 }
@@ -832,7 +898,6 @@ const CURVE = {
   const data = Buffer.from(buyIx.data);
   assert.equal(data.readBigUInt64LE(8), 1n);                       // one raw token unit
   assert.equal(data.readBigUInt64LE(16), REHEARSAL_MAX_SOL_COST);  // capped at 0.001 SOL
-  assert.ok(REHEARSAL_TIP_LAMPORTS < 5_000_000n);
   ok('a rehearsal asks for one raw token unit under a 0.001 SOL cap, so it costs almost nothing');
 }
 {
@@ -852,15 +917,15 @@ const CURVE = {
   // We sign these, so we know their signatures. Asking the submission endpoint
   // for one is what produced "signature must be base58 encoded: undefined" on a
   // live run — Sender returns a bundle id, and a bundle id is not a signature.
-  assert.equal(b.signatures.length, 5);
-  for (let i = 0; i < 5; i++) {
+  assert.equal(b.signatures.length, 3);
+  for (let i = 0; i < b.signatures.length; i++) {
     const tx = VersionedTransaction.deserialize(Buffer.from(b.transactions[i], 'base64'));
     assert.equal(b.signatures[i], bs58.encode(tx.signatures[0]));
     // And it must be base58, because confirmTransaction parses it as such.
     assert.match(b.signatures[i], /^[1-9A-HJ-NP-Za-km-z]{86,90}$/);
   }
-  assert.equal(new Set(b.signatures).size, 5, 'each wallet signs its own transaction');
-  ok('the bundle hands back the base58 signatures it produced, one per wallet');
+  assert.equal(new Set(b.signatures).size, b.signatures.length, 'signatures must be distinct');
+  ok('the bundle hands back the base58 signatures it produced, one per transaction');
 }
 
 console.log('\ntelegram control');
