@@ -208,6 +208,14 @@ export class PumpSniper extends EventEmitter {
      *  only at creation, so without this the second buy by anyone else would
      *  re-fire the bundle. */
     this.fired = new Set();
+    /** `mint:reason` pairs already reported. A curve is written on EVERY trade,
+     *  so an unfiltered refusal is one log line and one Telegram message per
+     *  trade on the token for as long as it lives. The first refusal of a kind
+     *  carries the information; the rest only repeat that the token is still
+     *  trading, and they arrive fast enough to bury the settle report and to
+     *  put the chat over its rate limit. Cleared on every arm and every new
+     *  target, so each run reports afresh. */
+    this.reported = new Set();
     this.armed = false;
   }
 
@@ -513,6 +521,9 @@ export class PumpSniper extends EventEmitter {
     // still being set up would otherwise be dropped by the guard in the handler
     // — the one case the whole program exists for.
     this.armed = true;
+    // Each arming is a fresh intent: whatever we refused last time, the
+    // operator wants to hear the reason again rather than infer it from silence.
+    this.reported.clear();
     for (const mint of this.mints) {
       const curveAddress = deriveBondingCurve(mint);
       const key = mint.toBase58();
@@ -556,6 +567,58 @@ export class PumpSniper extends EventEmitter {
     }
   }
 
+  /**
+   * Stop watching one mint — our own bookkeeping first, the RPC in its own time.
+   *
+   * The map entries are dropped synchronously and the unsubscribe is left to
+   * run unawaited, because this is called from the fire path: waiting on a
+   * websocket round trip there would give back the lead the whole program
+   * exists to take. Callers that need to know whether anything is still
+   * watched can read `subscriptions.size` on the next line and be right.
+   *
+   * Writes already in flight when this runs are still delivered. That is what
+   * the guards at the top of #onCurveWrite are for.
+   */
+  #stopWatchingMint(key) {
+    for (const map of [this.subscriptions, this.mintSubscriptions]) {
+      const subId = map.get(key);
+      if (subId === undefined) continue;
+      map.delete(key);
+      Promise.resolve()
+        .then(() => this.connection.removeAccountChangeListener(subId))
+        .catch(() => { /* the socket may already be gone; there is nothing to undo */ });
+    }
+  }
+
+  /**
+   * This mint is finished with — bought, or gone somewhere we can never buy it.
+   *
+   * Dropping the subscription is the point: a curve we can no longer act on
+   * still emits a write on every trade, and the only thing we could do with
+   * one is refuse it. Disarming once the last mint is retired keeps /status
+   * honest, so the operator is never shown ARMED over a sniper that is
+   * watching nothing.
+   */
+  #retireMint(key, reason) {
+    this.#stopWatchingMint(key);
+    this.#disarmIfNothingWatched(key, reason);
+  }
+
+  /**
+   * Drop the armed flag once the last subscription is gone.
+   *
+   * Kept apart from #stopWatchingMint because the fire path needs the two at
+   * DIFFERENT times. Unsubscribing is safe the instant the budgets are claimed.
+   * Disarming is not: `armed` is what refuses a mode change, and a /live
+   * arriving between the claim and the send would otherwise turn a paper
+   * rehearsal into a real bundle. So the flag holds until the fire is over.
+   */
+  #disarmIfNothingWatched(key, reason) {
+    if (this.subscriptions.size > 0 || !this.armed) return;
+    this.armed = false;
+    this.emit('disarmed', { mint: key, reason });
+  }
+
   async unwatch() {
     this.armed = false;
     for (const [key, subId] of this.subscriptions) {
@@ -594,7 +657,17 @@ export class PumpSniper extends EventEmitter {
     const curve = decodeBondingCurve(accountInfo?.data);
     const verdict = this.assess(mint, curve);
     if (!verdict.act) {
-      this.emit('skipped', { mint: key, slot: context?.slot ?? null, ...verdict });
+      const seen = `${key}:${verdict.reason}`;
+      if (!this.reported.has(seen)) {
+        this.reported.add(seen);
+        this.emit('skipped', { mint: key, slot: context?.slot ?? null, ...verdict, repeatsSuppressed: true });
+      }
+      // A graduated curve has moved to a DEX and will never be buyable here
+      // again, so there is nothing left for the subscription to tell us.
+      // 'pre-bought' is not terminal — people sell, and a curve that is over
+      // the operator's limit now can come back under it — so that one keeps
+      // watching, quietly.
+      if (verdict.reason === 'graduated') this.#retireMint(key, 'graduated');
       return;
     }
 
@@ -602,91 +675,107 @@ export class PumpSniper extends EventEmitter {
     // otherwise both pass assess() and fire two bundles for one launch.
     this.fired.add(key);
 
-    // Re-plan against what the curve ACTUALLY holds rather than the pre-launch
-    // state we planned against at boot. Usually identical; when it is not,
-    // somebody moved first and the boot plan would have asked for more tokens
-    // than the curve can now give at our cap — which reverts the whole bundle.
-    // Re-planning is arithmetic on numbers already in hand, so it costs nothing
-    // measurable and removes the failure entirely.
-    const planned = this.plan({
-      virtualTokenReserves: curve.virtualTokenReserves,
-      virtualSolReserves: curve.virtualSolReserves,
-      realTokenReserves: curve.realTokenReserves,
-      realSolReserves: curve.realSolReserves,
-      complete: curve.complete,
-    });
+    // And stop listening to it, in the same synchronous step as the claim.
+    // From here the budgets are committed, so no later write to this curve can
+    // produce an action — but writes keep coming for as long as anyone trades
+    // the token, and the only use left for them is to drown the settle report
+    // that the operator is actually waiting for.
+    //
+    // Only the subscription goes now. Disarming waits for the finally below,
+    // so the mode cannot change under a bundle that is still being built.
+    this.#stopWatchingMint(key);
 
-    this.emit('firing', {
-      mint: key,
-      slot: context?.slot ?? null,
-      creator: curve.creator.toBase58(),
-      legs: planned.legs.map((l) => ({
-        wallet: l.address,
-        budgetLamports: l.budgetLamports.toString(),
-        solIntoCurve: l.solIntoCurve.toString(),
-        expectedTokens: l.expectedTokens.toString(),
-        requestTokens: l.requestTokens.toString(),
-        maxSolCost: l.maxSolCost.toString(),
-      })),
-    });
-
-    // If the background refresh has fallen behind, try once more here rather
-    // than signing something that cannot land. This costs a round trip only in
-    // the case that would otherwise waste the whole launch.
-    if (Date.now() - this.blockhashAt > MAX_BLOCKHASH_AGE_MS) {
-      this.emit('warn', { at: 'blockhash', refreshingInFirePath: true, ageMs: Date.now() - this.blockhashAt });
-      await this.#refreshBlockhash().catch(() => {});
-    }
-
-    const { tokenProgram, cached } = await this.#resolveTokenProgram(mint);
-    const bundle = this.buildBundle({ mint, curve, planned, tokenProgram });
-
-    if (this.paper) {
-      this.emit('paper', {
-        mint: key, slot: context?.slot ?? null,
-        transactions: bundle.built.length,
-        sizes: bundle.built.map((b) => b.size),
-        tokenProgram: tokenProgram.toBase58(),
-        tokenProgramCached: cached,
-        elapsedMs: Date.now() - seenAt,
+    try {
+      // Re-plan against what the curve ACTUALLY holds rather than the pre-launch
+      // state we planned against at boot. Usually identical; when it is not,
+      // somebody moved first and the boot plan would have asked for more tokens
+      // than the curve can now give at our cap — which reverts the whole bundle.
+      // Re-planning is arithmetic on numbers already in hand, so it costs nothing
+      // measurable and removes the failure entirely.
+      const planned = this.plan({
+        virtualTokenReserves: curve.virtualTokenReserves,
+        virtualSolReserves: curve.virtualSolReserves,
+        realTokenReserves: curve.realTokenReserves,
+        realSolReserves: curve.realSolReserves,
+        complete: curve.complete,
       });
-      return;
+
+      this.emit('firing', {
+        mint: key,
+        slot: context?.slot ?? null,
+        creator: curve.creator.toBase58(),
+        legs: planned.legs.map((l) => ({
+          wallet: l.address,
+          budgetLamports: l.budgetLamports.toString(),
+          solIntoCurve: l.solIntoCurve.toString(),
+          expectedTokens: l.expectedTokens.toString(),
+          requestTokens: l.requestTokens.toString(),
+          maxSolCost: l.maxSolCost.toString(),
+        })),
+      });
+
+      // If the background refresh has fallen behind, try once more here rather
+      // than signing something that cannot land. This costs a round trip only in
+      // the case that would otherwise waste the whole launch.
+      if (Date.now() - this.blockhashAt > MAX_BLOCKHASH_AGE_MS) {
+        this.emit('warn', { at: 'blockhash', refreshingInFirePath: true, ageMs: Date.now() - this.blockhashAt });
+        await this.#refreshBlockhash().catch(() => {});
+      }
+
+      const { tokenProgram, cached } = await this.#resolveTokenProgram(mint);
+      const bundle = this.buildBundle({ mint, curve, planned, tokenProgram });
+
+      if (this.paper) {
+        this.emit('paper', {
+          mint: key, slot: context?.slot ?? null,
+          transactions: bundle.built.length,
+          sizes: bundle.built.map((b) => b.size),
+          tokenProgram: tokenProgram.toBase58(),
+          tokenProgramCached: cached,
+          elapsedMs: Date.now() - seenAt,
+        });
+        return;
+      }
+
+      const result = await this.sender.sendBundle(bundle.transactions);
+      // The bundle is atomic, so confirming ANY of its transactions confirms all
+      // of them. The first is as good as any and is the one we can name.
+      const signature = bundle.signatures[0];
+      this.emit('sent', {
+        mint: key, slot: context?.slot ?? null,
+        signature,
+        bundleId: result.bundleId ?? null,
+        signatures: bundle.signatures,
+        blockhashAgeMs: Date.now() - this.blockhashAt,
+        elapsedMs: Date.now() - seenAt,
+        rehearsal: this.rehearse,
+      });
+
+      // Accepted is not landed, and reporting only the submission is what made
+      // three failed attempts look like three successes. Sender answers with a
+      // real transaction SIGNATURE rather than a bundle id, so this confirms
+      // against the chain itself instead of asking an API that answered "Invalid"
+      // for everything.
+      const { blockhash, lastValidBlockHeight } = this.blockhash;
+      this.connection.confirmTransaction(
+        { signature, blockhash, lastValidBlockHeight }, 'confirmed',
+      ).then((res) => this.emit('settled', {
+        mint: key, signature,
+        landed: !res.value.err,
+        error: res.value.err ? JSON.stringify(res.value.err) : null,
+      })).catch((err) => this.emit('settled', {
+        // Unconfirmed is a failure to OBSERVE, not a failure to land. Reporting it
+        // as failure invites resending something that already executed.
+        mint: key, signature, landed: null,
+        error: `unconfirmed: ${err?.message ?? err}`,
+      }));
+
+      return result;
+    } finally {
+      // Every exit, including a throw out of the send: a sniper that has
+      // spent its budgets and stopped watching must not still read ARMED.
+      this.#disarmIfNothingWatched(key, 'fired');
     }
-
-    const result = await this.sender.sendBundle(bundle.transactions);
-    // The bundle is atomic, so confirming ANY of its transactions confirms all
-    // of them. The first is as good as any and is the one we can name.
-    const signature = bundle.signatures[0];
-    this.emit('sent', {
-      mint: key, slot: context?.slot ?? null,
-      signature,
-      bundleId: result.bundleId ?? null,
-      signatures: bundle.signatures,
-      blockhashAgeMs: Date.now() - this.blockhashAt,
-      elapsedMs: Date.now() - seenAt,
-      rehearsal: this.rehearse,
-    });
-
-    // Accepted is not landed, and reporting only the submission is what made
-    // three failed attempts look like three successes. Sender answers with a
-    // real transaction SIGNATURE rather than a bundle id, so this confirms
-    // against the chain itself instead of asking an API that answered "Invalid"
-    // for everything.
-    const { blockhash, lastValidBlockHeight } = this.blockhash;
-    this.connection.confirmTransaction(
-      { signature, blockhash, lastValidBlockHeight }, 'confirmed',
-    ).then((res) => this.emit('settled', {
-      mint: key, signature,
-      landed: !res.value.err,
-      error: res.value.err ? JSON.stringify(res.value.err) : null,
-    })).catch((err) => this.emit('settled', {
-      // Unconfirmed is a failure to OBSERVE, not a failure to land. Reporting it
-      // as failure invites resending something that already executed.
-      mint: key, signature, landed: null,
-      error: `unconfirmed: ${err?.message ?? err}`,
-    }));
-
-    return result;
   }
 
   /**
@@ -713,10 +802,15 @@ export class PumpSniper extends EventEmitter {
     // A mint must be a real 32-byte key, not something off the ed25519 curve
     // check — PublicKey accepts any 32 bytes, so this only catches length.
     const wasArmed = this.armed;
-    if (this.subscriptions.size > 0) await this.unwatch();
+    // Unconditionally, not only when something is still subscribed: a mint that
+    // has already fired has had its subscription dropped, and the old code
+    // would then leave `armed` set over a sniper watching nothing.
+    await this.unwatch();
     this.mints = [mint];
-    // A new target has not been bought yet, whatever the old one's state was.
+    // A new target has not been bought yet, whatever the old one's state was,
+    // and none of the old target's refusals say anything about this one.
     this.fired.delete(mint.toBase58());
+    this.reported.clear();
     this.emit('target', { mint: mint.toBase58(), bondingCurve: deriveBondingCurve(mint).toBase58(), wasArmed });
     return mint;
   }

@@ -121,7 +121,31 @@ async function main() {
   sniper.on('watching', (d) => log('info', 'watching', d));
   sniper.on('target', (d) => log('info', 'target set', d));
   sniper.on('mode', (d) => log('info', 'mode', d));
-  sniper.on('skipped', (d) => { log('warn', 'skipped', d); notify(`⚠️ Skipped <code>${d.mint}</code> — ${d.reason}`); });
+  // The sniper reports each refusal once per arming, not once per write, so
+  // this is safe to put on the phone. 'already-fired' is the exception: it is
+  // the expected answer for a write that raced our own unsubscribe, and reading
+  // "Skipped" straight after a successful buy would look like a failure.
+  sniper.on('skipped', (d) => {
+    if (d.reason === 'already-fired') { log('info', 'skipped (raced our unsubscribe)', d); return; }
+    log('warn', 'skipped', d);
+    // Graduation gets its own message from the 'disarmed' handler below, which
+    // says more. Two alerts for one fact is how an operator learns to skim.
+    if (d.reason === 'graduated') return;
+    notify(`⚠️ Skipped <code>${d.mint}</code> — ${d.reason}`
+      + (d.detail ? `\n${d.detail}` : '')
+      + '\n\nFurther writes of this kind will not be reported.');
+  });
+  // Disarming on 'fired' is not worth a message: it happens between LAUNCH
+  // DETECTED and BUNDLE SENT, so a phone alert there would announce the end of
+  // the run before the run's result, and LANDED already closes the story.
+  // Graduation is the opposite case — nothing else would ever mention it, and
+  // an operator who is not told will sit waiting on a token that has left.
+  sniper.on('disarmed', (d) => {
+    log('signal', 'DISARMED', d);
+    if (d.reason === 'fired') return;
+    notify(`\u{1F6D1} <b>DISARMED</b>\n<code>${d.mint}</code> has graduated off the bonding curve `
+      + 'and can no longer be bought here. Nothing was spent.');
+  });
   sniper.on('firing', (d) => { log('signal', `LAUNCH ${d.mint}`, { slot: d.slot }); notify(`\u{1F680} <b>LAUNCH DETECTED</b>\n<code>${d.mint}</code>\nslot ${d.slot}`); });
   sniper.on('paper', (d) => {
     lastResult = `paper bundle built in ${d.elapsedMs}ms`;
@@ -161,7 +185,18 @@ async function main() {
       + `accepted by the relays and executed by nobody. Check the RPC connection.`,
     );
   });
-  sniper.on('error', (d) => { log('error', 'error', d); notify(`\u{1F534} Error: ${d.error}`); });
+  sniper.on('error', (d) => {
+    log('error', 'error', d);
+    // An error raised after the budgets were claimed leaves the sniper disarmed,
+    // and the operator needs that in the SAME message: otherwise Telegram still
+    // reads ARMED to them and they wait for a fire that can no longer come.
+    // Keyed on the fired set rather than on `armed`, because that is the exact
+    // condition under which money may already have moved.
+    const claimed = d.mint ? sniper.fired.has(d.mint) : false;
+    notify(`\u{1F534} Error: ${d.error}`
+      + (claimed ? '\n\nThe budgets were already committed and the sniper has stopped watching. '
+        + 'Check the wallets on an explorer before re-arming \u2014 the bundle may have landed anyway.' : ''));
+  });
 
   await sniper.prime();
   sniper.startBlockhashRefresh(cfg.blockhashRefreshMs ?? 2000);

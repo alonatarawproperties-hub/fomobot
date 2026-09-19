@@ -1149,4 +1149,251 @@ const cmd = (line) => {
   ok('status and help both surface the max pre-buy, so a left-behind value is visible');
 }
 
+console.log('\nretiring a curve we can no longer act on');
+
+// A curve account is written on EVERY trade for as long as the token lives.
+// Everything below is about what the sniper does with writes it can do nothing
+// about — because doing the obvious thing (report each one) is what buried the
+// settle report under hundreds of lines on the first live run.
+
+// Encode a bonding curve the way the chain lays one out, so these tests go
+// through decodeBondingCurve rather than around it. Offsets from pump.mjs.
+function encodeCurve({ vTok = INITIAL_V_TOK, vSol = INITIAL_V_SOL, rTok = INITIAL_R_TOK,
+                       rSol = 0n, complete = false, creator = Keypair.generate().publicKey } = {}) {
+  const b = Buffer.alloc(151);
+  b.writeBigUInt64LE(vTok, 8);
+  b.writeBigUInt64LE(vSol, 16);
+  b.writeBigUInt64LE(rTok, 24);
+  b.writeBigUInt64LE(rSol, 32);
+  b.writeBigUInt64LE(TOTAL_SUPPLY, 40);
+  b[48] = complete ? 1 : 0;
+  creator.toBuffer().copy(b, 49);
+  return b;
+}
+
+// A connection that records subscriptions and hands back the callbacks, so a
+// test can deliver a curve write the same way the RPC would.
+function subscriptionSpy() {
+  let next = 1;
+  const live = new Map();          // subId -> { address, cb }
+  const removed = [];
+  return {
+    live, removed,
+    onAccountChange(address, cb) {
+      const id = next++;
+      live.set(id, { address: address.toBase58(), cb });
+      return id;
+    },
+    async removeAccountChangeListener(id) { removed.push(id); live.delete(id); },
+    async getAccountInfo() { return null; },
+    curveCallbackFor(mint) {
+      const want = deriveBondingCurve(new PublicKey(mint)).toBase58();
+      for (const v of live.values()) if (v.address === want) return v.cb;
+      return null;
+    },
+  };
+}
+
+// Deliver a write and wait for the handler to settle. #onCurveWrite is async
+// and the subscription callback drops the promise, so a test that does not wait
+// asserts on a half-finished fire.
+async function deliver(spy, mint, data, slot = 1) {
+  const cb = spy.curveCallbackFor(mint);
+  assert.ok(cb, 'nothing is subscribed to that curve');
+  cb({ data }, { slot });
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+}
+
+function armedSniper(overrides = {}) {
+  const spy = subscriptionSpy();
+  const s = offlineSniper({ connection: spy, paper: true, maxPreBuyLamports: 500_000_000n, ...overrides });
+  const events = [];
+  for (const name of ['skipped', 'disarmed', 'firing', 'paper', 'error']) {
+    s.on(name, (d) => events.push({ name, ...d }));
+  }
+  // The fire path needs the token program; on a real launch the mint
+  // subscription supplies it. Seed it so the test is about retirement.
+  s.tokenPrograms.set(s.mints[0].toBase58(), TOKEN_2022_PROGRAM);
+  return { s, spy, events };
+}
+
+{
+  const { s, spy, events } = armedSniper();
+  const mint = s.mints[0].toBase58();
+  await s.watch();
+  assert.equal(s.subscriptions.size, 1);
+  assert.equal(s.mintSubscriptions.size, 1);
+
+  await deliver(spy, mint, encodeCurve());
+  assert.ok(events.some((e) => e.name === 'firing'), 'it should have fired');
+
+  // The whole point: once the budgets are committed, nothing is left watching.
+  assert.equal(s.subscriptions.size, 0);
+  assert.equal(s.mintSubscriptions.size, 0);
+  assert.equal(spy.removed.length, 2);
+  assert.equal(spy.live.size, 0);
+  assert.equal(s.armed, false);
+  const off = events.find((e) => e.name === 'disarmed');
+  assert.equal(off?.reason, 'fired');
+  ok('firing drops both of the mint subscriptions and leaves the sniper disarmed');
+}
+{
+  // Writes already in flight when we unsubscribe are still delivered. They must
+  // cost nothing: no second bundle, and no report either.
+  const { s, spy, events } = armedSniper();
+  const mint = s.mints[0].toBase58();
+  await s.watch();
+  const cb = spy.curveCallbackFor(mint);
+  await deliver(spy, mint, encodeCurve());
+  const after = events.length;
+
+  for (let i = 0; i < 50; i++) cb({ data: encodeCurve({ rSol: BigInt(i) }) }, { slot: 2 + i });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(events.length, after, 'a write after firing must produce no event at all');
+  assert.equal(events.filter((e) => e.name === 'firing').length, 1);
+  ok('fifty writes racing the unsubscribe fire nothing and report nothing');
+}
+{
+  // The other firehose, and the one the subscription drop does NOT close:
+  // a curve we refuse is written on every trade too.
+  const { s, spy, events } = armedSniper({ maxPreBuyLamports: 1n });
+  const mint = s.mints[0].toBase58();
+  await s.watch();
+  for (let i = 0; i < 40; i++) await deliver(spy, mint, encodeCurve({ rSol: 500_000_000n + BigInt(i) }), 10 + i);
+
+  const skips = events.filter((e) => e.name === 'skipped');
+  assert.equal(skips.length, 1, 'forty refusals of one kind are one report');
+  assert.equal(skips[0].reason, 'pre-bought');
+  assert.equal(skips[0].repeatsSuppressed, true);
+  assert.match(skips[0].detail, /limit 1/);
+
+  // Pre-bought is not terminal: people sell, so the curve can come back under
+  // the limit and we must still be there when it does.
+  assert.equal(s.subscriptions.size, 1);
+  assert.equal(s.armed, true);
+  await deliver(spy, mint, encodeCurve({ rSol: 0n }), 99);
+  assert.ok(events.some((e) => e.name === 'firing'), 'a curve that drops back under the limit is still bought');
+  ok('a refusal is reported once per kind, and a pre-bought curve stays watched in case it comes back');
+}
+{
+  // Two different refusals are two different pieces of information.
+  const { s, spy, events } = armedSniper({ maxPreBuyLamports: 1n });
+  const mint = s.mints[0].toBase58();
+  await s.watch();
+  await deliver(spy, mint, encodeCurve({ rSol: 500_000_000n }));
+  await deliver(spy, mint, Buffer.alloc(4));            // too short to decode
+  await deliver(spy, mint, encodeCurve({ rSol: 500_000_000n }));
+  const reasons = events.filter((e) => e.name === 'skipped').map((e) => e.reason);
+  assert.deepEqual(reasons, ['pre-bought', 'undecodable']);
+  ok('a second KIND of refusal is still reported, while the first kind stays quiet');
+}
+{
+  // Graduated is terminal — the token has left the bonding curve for a DEX and
+  // no write will ever make it buyable here again.
+  const { s, spy, events } = armedSniper();
+  const mint = s.mints[0].toBase58();
+  await s.watch();
+  await deliver(spy, mint, encodeCurve({ complete: true }));
+  assert.equal(events.filter((e) => e.name === 'skipped')[0].reason, 'graduated');
+  assert.equal(events.find((e) => e.name === 'disarmed')?.reason, 'graduated');
+  assert.equal(s.subscriptions.size, 0);
+  assert.equal(s.mintSubscriptions.size, 0);
+  assert.equal(s.armed, false);
+  assert.equal(s.fired.has(mint), false, 'refusing a curve is not buying it');
+  ok('a graduated curve retires the mint instead of being refused forever');
+}
+{
+  // Re-arming is a fresh intent: the operator asked again, so they are told
+  // again rather than left to infer the reason from silence.
+  const { s, spy, events } = armedSniper({ maxPreBuyLamports: 1n });
+  const mint = s.mints[0].toBase58();
+  await s.watch();
+  await deliver(spy, mint, encodeCurve({ rSol: 500_000_000n }));
+  assert.equal(events.filter((e) => e.name === 'skipped').length, 1);
+  await s.unwatch();
+  await s.watch();
+  await deliver(spy, mint, encodeCurve({ rSol: 500_000_000n }));
+  assert.equal(events.filter((e) => e.name === 'skipped').length, 2);
+  ok('re-arming reports the same refusal again, so a disarm/arm cycle is never silent');
+}
+{
+  // The bug the unconditional unwatch() in setTarget closes: after a fire there
+  // is nothing subscribed, so the old `size > 0` guard skipped the unwatch and
+  // left `armed` true over a sniper watching nothing.
+  const { s, spy } = armedSniper();
+  const mint = s.mints[0].toBase58();
+  await s.watch();
+  await deliver(spy, mint, encodeCurve());
+  s.armed = true;                       // as the old guard would have left it
+  await s.setTarget(Keypair.generate().publicKey.toBase58());
+  assert.equal(s.armed, false, 'setting a new target must never leave the sniper armed');
+  assert.equal(s.subscriptions.size, 0);
+  ok('a new target disarms even when the previous one had already fired');
+}
+{
+  // A new target says nothing about the old one's refusals.
+  const { s, spy, events } = armedSniper({ maxPreBuyLamports: 1n });
+  await s.watch();
+  await deliver(spy, s.mints[0].toBase58(), encodeCurve({ rSol: 500_000_000n }));
+  assert.equal(s.reported.size, 1);
+  await s.setTarget(Keypair.generate().publicKey.toBase58());
+  assert.equal(s.reported.size, 0);
+  await s.watch();
+  await deliver(spy, s.mints[0].toBase58(), encodeCurve({ rSol: 500_000_000n }));
+  assert.equal(events.filter((e) => e.name === 'skipped').length, 2);
+  ok('retargeting clears what was reported, so the new mint reports its own refusals');
+}
+{
+  // The reason unsubscribing and disarming are NOT done in the same step.
+  // `armed` is what refuses a mode change; if it dropped at the claim, a /live
+  // arriving in the window before the send would turn a rehearsal into a real
+  // bundle. So it has to survive the whole fire.
+  const { s, spy } = armedSniper();
+  let checked = false;
+  s.on('firing', () => {
+    checked = true;
+    assert.equal(s.armed, true, 'the sniper must still count as armed mid-fire');
+    assert.throws(() => s.setMode('live'), /disarm before changing mode/);
+    assert.equal(s.mode, 'paper');
+  });
+  await s.watch();
+  await deliver(spy, s.mints[0].toBase58(), encodeCurve());
+  assert.ok(checked, 'the firing hook never ran');
+  assert.equal(s.armed, false, 'and it must be disarmed once the fire is over');
+  ok('the mode cannot be switched between claiming the budgets and sending the bundle');
+}
+{
+  // A write landing DURING the fire — after the claim, before the send — is the
+  // case the fired-set has always guarded. It must still not buy twice, and it
+  // must not turn into a second report either.
+  const { s, spy, events } = armedSniper();
+  const mint = s.mints[0].toBase58();
+  await s.watch();
+  const cb = spy.curveCallbackFor(mint);
+  s.on('firing', () => {
+    for (let i = 0; i < 20; i++) cb({ data: encodeCurve({ rSol: BigInt(i) }) }, { slot: 5 });
+  });
+  await deliver(spy, mint, encodeCurve());
+  assert.equal(events.filter((e) => e.name === 'firing').length, 1, 'one launch, one bundle');
+  const skips = events.filter((e) => e.name === 'skipped');
+  assert.equal(skips.length, 1, 'twenty re-entrant writes are at most one report');
+  assert.equal(skips[0].reason, 'already-fired');
+  ok('twenty writes arriving mid-fire buy nothing twice and report once');
+}
+{
+  // The failure that would otherwise leave a lie on the operator's phone: the
+  // send throws, so nothing is watched and the budgets are claimed, but
+  // Telegram still reads ARMED and the operator waits for a fire that cannot come.
+  const { s, spy, events } = armedSniper({ paper: false });
+  s.sender = { sendBundle: async () => { throw new Error('sender said no'); } };
+  await s.watch();
+  await deliver(spy, s.mints[0].toBase58(), encodeCurve());
+  assert.match(events.find((e) => e.name === 'error')?.error ?? '', /sender said no/);
+  assert.equal(s.armed, false, 'a failed send must still disarm');
+  assert.equal(s.subscriptions.size, 0);
+  assert.equal(events.find((e) => e.name === 'disarmed')?.reason, 'fired');
+  ok('a send that throws still leaves the sniper disarmed rather than falsely armed');
+}
+
 console.log(`\n${pass} passed\n`);
