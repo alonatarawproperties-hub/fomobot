@@ -794,51 +794,52 @@ curve — at a launch both are created in the same transaction, so the answer is
 normally cached before the trigger arrives. When it is not, one read resolves it,
 which is worth the round trip because the alternative is a guaranteed failure.
 
-### One transaction, not a Jito bundle
+### The bundle goes through Helius Sender, not Jito's public endpoint
 
-The first version put the five buys in a Jito bundle. Jito accepted every one —
-five relays, HTTP 200, a bundle id — and then silently discarded them all:
-status `Invalid`, never reaching `Pending`, nothing on chain. Three attempts,
-identical. Isolating it took stripping the submission to a 217-byte transaction
-containing **nothing but a tip**, which was also dropped. That rules out
-everything about what was being sent.
-
-What that taught, by probing Jito's ingress directly: a malformed bundle is
-rejected with HTTP **400 and a named reason** — "transaction is invalid", "must
-write lock at least one tip account", "exceeded maximum number of transactions".
-Getting a 200 and an id therefore proves signatures, tip presence, tip
-write-lock, transaction count and wire format are all correct. And an expired
-blockhash or an unfunded payer *also* returns 200 and an id before going
-`Invalid`, so that response carries no information at all.
-
-A bundle delegates atomicity to a block engine that can decline to forward it.
-**One transaction needs nobody's permission**: the runtime applies it whole or
-not at all, and it lands through ordinary RPC with a priority fee.
-
-Five buys do not fit in 1232 bytes on their own — measured:
+Five wallets, five transactions, one atomic bundle — all five fill or none do.
+That is what every trading terminal does, and it is right: Solana caps a
+transaction's instruction trace at **64 invocations**, and a pump.fun buy costs 8
+while its token-account create costs 5. Measured from a real landed transaction:
 
 ```
-              no lookup table    with lookup table
-  1 buy            787 bytes           356 bytes
-  3 buys          1217 bytes           662 bytes
-  4 buys          1432 OVER            815 bytes
-  5 buys     will not compile          968 bytes
+invocations per instruction:  1, 1, 5, 8, 5, 8, 5, 8, ...
+                              ^  ^  ^  ^
+                     compute budget  |  +-- pump buy      = 8
+                                     +----- ATA create    = 5
 ```
 
-So an address lookup table carries the 46 shared accounts, each costing one byte
-in the message instead of 32. The real transaction measures **1000 bytes**
-against the 1232 limit, with five signatures, built and signed in 29.8ms.
+Five wallets in ONE transaction is `2 + 5x13 = 67`, and it fails with
+`MaxInstructionTraceLengthExceeded`. Split across five transactions, each gets
+its own 64-invocation budget and spends 13.
 
-Everything in the table is derivable from the contract address, which is known in
-advance — so it is built at `/target` and warm long before it is needed. It
-cannot be built at fire time: a table's entries are only usable in a *later slot*
-than the one that added them. The one exception is the creator vault, a PDA of
-the token's creator, which is unknowable until the curve exists; it stays a
-static key, which the byte budget has room for.
+**But the bundle has to reach a block.** Three bundles posted to Jito's public
+block engine were accepted by five relays, given a bundle id, and silently
+discarded: status `Invalid`, never `Pending`, nothing on chain. A probe reduced
+that to a 217-byte transaction containing nothing but a tip, sent to one relay,
+and it was dropped the same way — so nothing about what we send was ever the
+cause. Unauthenticated submission is not honoured.
 
-There is no tip any more. Outside a bundle a tip is a donation, not a bid.
+What that probing did establish: Jito's ingress rejects a malformed bundle with
+HTTP **400 and a named reason** — "transaction is invalid", "must write lock at
+least one tip account", "exceeded maximum number of transactions". So a 200 with
+an id proves signatures, tip presence, tip write-lock, count and wire format are
+all correct. An expired blockhash and an unfunded payer *also* return 200 and an
+id before going `Invalid`, which is why that response carries no information.
 
-### Five buys in one transaction move the curve against each other
+**Helius Sender** takes the identical bundle format, forwards it across every
+fast pathway including Jito, runs on **any Helius plan** and consumes **no API
+credits** — the cost is the tip. It also validates synchronously, so a bad
+bundle comes back with a reason instead of vanishing. And it answers with a real
+transaction **signature**, which can be confirmed against the chain, rather than
+a bundle id that could only be asked about through an API that said `Invalid` for
+everything.
+
+The tip must be at least **0.001 SOL** and goes to a **Helius** tip account —
+a different list from Jito's, and a tip to the wrong one is money thrown away.
+Below the minimum the bundle skips the priority buffer and takes fewer pathways,
+which defeats the point on a launch, so startup refuses it.
+
+### Five buys in one bundle move the curve against each other
 
 The five buys execute in order inside one transaction, and a transaction is
 all-or-nothing, so one reverting buy reverts the other four.

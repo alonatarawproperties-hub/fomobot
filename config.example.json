@@ -89,7 +89,7 @@
     "wsUrl": null
   },
   "pumpSniper": {
-    "_comment": "pump.fun launch sniper, driven by `npm run snipe-pump`. Five wallets buy ONE launch in ONE TRANSACTION - not a Jito bundle. Jito silently discarded every bundle we sent (accepted by five relays, status Invalid, never reaching the auction, even for a 217-byte transaction carrying nothing but a tip), so atomicity now comes from the Solana runtime instead: one transaction applies whole or not at all. Five buys need an address lookup table to fit in 1232 bytes; it is built when you /target and costs a little rent. There is no tip - outside a bundle a tip is a donation, not a bid. This is a DIFFERENT bot from the `snipe` block above, which is the Meteora DBC sniper. THE KEYS ARE NEVER IN THIS FILE - wallet N reads FIRSTFILL_SNIPER_KEY_N from the environment. `mints` is OPTIONAL and normally empty: the contract address arrives over Telegram with /target. computeUnitPriceMicroLamports is the priority fee bid; the unit LIMIT is computed from the wallet count (120,000 per buy) and is not configurable, because under-requesting it fails the whole transaction and over-requesting it just costs more.",
+    "_comment": "pump.fun launch sniper, driven by `npm run snipe-pump`. Five wallets buy ONE launch as ONE ATOMIC JITO-FORMAT BUNDLE of five transactions - one per wallet - submitted through HELIUS SENDER (https://sender.helius-rpc.com/fast), not Jito's public endpoint. Jito silently discarded every bundle we sent it unauthenticated: accepted by five relays, status Invalid, never reaching the auction, even for a 217-byte transaction carrying nothing but a tip. Sender takes the same bundle format, forwards it across every fast path including Jito, works on ANY Helius plan and consumes no API credits - you pay the tip. senderTipSol must be at least 0.001: below that the bundle skips the priority buffer and takes fewer pathways. Five SEPARATE transactions, not one, because Solana caps a transaction's instruction trace at 64 and five buys plus five token-account creates is 67. THE KEYS ARE NEVER IN THIS FILE - wallet N reads FIRSTFILL_SNIPER_KEY_N from the environment. `mints` is OPTIONAL and normally empty: the contract address arrives over Telegram with /target.",
     "rpcUrl": "https://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
     "wsUrl": "wss://mainnet.helius-rpc.com/?api-key=YOUR_HELIUS_KEY",
     "totalSol": "10",
@@ -117,6 +117,8 @@
       }
     ],
     "slippageBps": 500,
+    "senderTipSol": "0.001",
+    "tipWalletIndex": 4,
     "maxPreBuySol": "0.5",
     "computeUnitPriceMicroLamports": 500000,
     "blockhashRefreshMs": 2000
