@@ -15,6 +15,16 @@
 //
 //   node scripts/set-snipe-plan.mjs --total 15 --tip 0.01 --maxprebuy 32
 //
+// By default the wallet proportions already in the file are kept and only
+// scaled — the unevenness is deliberate and retyping it is how it stops being
+// uneven. --weights replaces that shape when there is none worth keeping, e.g.
+// after a flat test run left all five equal:
+//
+//   --weights 2.37,1.42,2.11,1.58,2.07
+//
+// The weights are proportions, not amounts: they are scaled to --total, so the
+// same list works at any size.
+//
 // --maxprebuy is the ceiling on how much SOL the curve may ALREADY hold when
 // the bot looks at it. On a launch you snipe cold that is small — anything in
 // there is somebody ahead of you. When you are the dev and your own buy lands
@@ -36,8 +46,10 @@ function arg(name) {
 const totalArg = arg('total');
 const tipArg = arg('tip');
 const maxPreArg = arg('maxprebuy');
+const weightsArg = arg('weights');
 if (!totalArg) {
-  console.error('usage: node scripts/set-snipe-plan.mjs --total <SOL> [--tip <SOL>] [--maxprebuy <SOL>]');
+  console.error('usage: node scripts/set-snipe-plan.mjs --total <SOL> [--tip <SOL>] [--maxprebuy <SOL>]'
+    + ' [--weights a,b,c,d,e]');
   process.exit(1);
 }
 
@@ -48,8 +60,21 @@ if (!Array.isArray(s.wallets) || s.wallets.length === 0) throw new Error('config
 
 // Keep the shape the operator chose. Scaling the existing amounts rather than
 // asking for five new ones is the point: the unevenness is deliberate, and
-// retyping it is how it stops being uneven.
-const old = s.wallets.map((w) => solStringToLamports(w.sol, `config: wallet ${w.address}`));
+// retyping it is how it stops being uneven. --weights is the escape hatch for
+// when the shape in the file is not one worth keeping — a flat test run leaves
+// every wallet equal, and scaling equal amounts only ever gives equal amounts.
+let old;
+if (weightsArg === null) {
+  old = s.wallets.map((w) => solStringToLamports(w.sol, `config: wallet ${w.address}`));
+} else {
+  const parts = weightsArg.split(',').map((x) => x.trim());
+  if (parts.length !== s.wallets.length) {
+    throw new Error(`--weights has ${parts.length} values but there are ${s.wallets.length} wallets`);
+  }
+  // Parsed as SOL so one parser decides what a number is, here and in the bot.
+  // Their absolute size is irrelevant — only the ratios survive the scaling.
+  old = parts.map((x, i) => solStringToLamports(x, `--weights[${i}]`));
+}
 const oldTotal = old.reduce((a, b) => a + b, 0n);
 const target = solStringToLamports(totalArg, '--total');
 
